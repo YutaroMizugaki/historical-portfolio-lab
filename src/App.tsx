@@ -5,7 +5,7 @@ import { defaultTer, TOKUTEI_TAX } from './data/costs'
 import { exposureOf } from './data/exposure'
 import { series, alignSelected } from './data/load'
 import { countAllocations, clipBounds } from './engine/allocations'
-import { pickByRiskReturn } from './engine/frontier'
+import { pickByRisk } from './engine/frontier'
 import { analyzeFx } from './engine/fx'
 import { rebalanceEveryMonths, simulatePath, evaluateWeights } from './engine/simulate'
 import { amountPrimary, pct, signedAmount, yearLabel, ymLabel } from './format'
@@ -118,7 +118,6 @@ export default function App() {
   const [picked, setPicked] = useState<number | null>(null)
   const [frontierMap, setFrontierMap] = useState<FrontierMap | null>(null)
   const [targetSigma, setTargetSigma] = useState(0)
-  const [targetMu, setTargetMu] = useState(0)
   const workerRef = useRef<Worker | null>(null)
   const pickTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -176,8 +175,8 @@ export default function App() {
     setSelected((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]))
   }
 
-  const applyFrontierPick = (map: FrontierMap, sigma: number, mu: number) => {
-    const point = pickByRiskReturn(map.frontier, sigma, mu)
+  const applyFrontierPick = (map: FrontierMap, sigma: number, withComparisons = false) => {
+    const point = pickByRisk(map.frontier, sigma)
     if (!point || aligned.dates.length < periodMonths + 1) return
     const evalInput = {
       returns: aligned.localReturns,
@@ -206,16 +205,18 @@ export default function App() {
     const scored = evaluateWeights(evalInput)
     setResult({
       best: scored,
-      comparisons: [
-        { label: '選択配分', candidate: scored },
-        ...referenceMixes(
-          chosen.map((a) => a.id),
-          chosen.map((a) => a.assetClass),
-        ).map(({ label, weights }) => ({
-          label,
-          candidate: evaluateWeights({ ...evalInput, weights }),
-        })),
-      ],
+      comparisons: withComparisons
+        ? [
+            { label: '選択配分', candidate: scored },
+            ...referenceMixes(
+              chosen.map((a) => a.id),
+              chosen.map((a) => a.assetClass),
+            ).map(({ label, weights }) => ({
+              label,
+              candidate: evaluateWeights({ ...evalInput, weights }),
+            })),
+          ]
+        : [{ label: '選択配分', candidate: scored }],
       searched: map.searched,
       stepUsed: map.stepUsed,
       note: map.note,
@@ -224,12 +225,12 @@ export default function App() {
     setPicked(worstI >= 0 ? worstI : 0)
   }
 
-  const scheduleFrontierPick = (map: FrontierMap, sigma: number, mu: number) => {
+  const scheduleFrontierPick = (map: FrontierMap, sigma: number) => {
     if (pickTimer.current) clearTimeout(pickTimer.current)
-    pickTimer.current = setTimeout(() => applyFrontierPick(map, sigma, mu), 60)
+    pickTimer.current = setTimeout(() => applyFrontierPick(map, sigma, true), 120)
   }
 
-  const selectedPoint = frontierMap ? pickByRiskReturn(frontierMap.frontier, targetSigma, targetMu) : null
+  const selectedPoint = frontierMap ? pickByRisk(frontierMap.frontier, targetSigma) : null
 
   const run = () => {
     if (chosen.length === 0 || aligned.dates.length < periodMonths + 1) return
@@ -260,8 +261,7 @@ export default function App() {
           setFrontierMap(next)
           if (mid) {
             setTargetSigma(mid.sigma)
-            setTargetMu(mid.mu)
-            applyFrontierPick(next, mid.sigma, mid.mu)
+            applyFrontierPick(next, mid.sigma, true)
           }
           setBusy(false)
           worker.terminate()
@@ -450,7 +450,7 @@ export default function App() {
             <p className="text-[11px] tracking-[0.22em] text-emerald-900 uppercase">Historical Portfolio Lab</p>
             <h1 className="font-serif text-3xl tracking-tight text-stone-900">どの年から始めても届く配分を探す</h1>
             <p className="mt-2 max-w-xl text-sm leading-relaxed text-stone-600">
-              リバランス時の譲渡課税・信託報酬・売買コストに加え、ドル資産は毎月の為替を円換算に入れた Rolling Backtest です。資産を選んだあと、予想リスクと期待リターンから配分を選ぶこともできます。
+              リバランス時の譲渡課税・信託報酬・売買コストに加え、ドル資産は毎月の為替を円換算に入れた Rolling Backtest です。資産を選んだあと、予想リスクのバーで効率的フロンティア上の配分を選べます。
             </p>
           </div>
           <div className="flex flex-wrap gap-2 text-[11px]">
@@ -759,7 +759,7 @@ export default function App() {
           )}
 
           {workspace === 'frontier' && (
-            <Card title="予想リスクと期待リターン">
+            <Card title="予想リスクで選ぶ">
               {frontierMap ? (
                 <div className="grid gap-4">
                   <Field label={`予想リスク（年率） ${pct(targetSigma, 1)}`}>
@@ -769,37 +769,34 @@ export default function App() {
                       min={frontierMap.minSigma}
                       max={Math.max(frontierMap.maxSigma, frontierMap.minSigma + 1e-6)}
                       step={0.0005}
-                      value={targetSigma}
+                      value={Math.min(frontierMap.maxSigma, Math.max(frontierMap.minSigma, targetSigma))}
                       onChange={(e) => {
                         const sigma = Number(e.target.value)
                         setTargetSigma(sigma)
-                        scheduleFrontierPick(frontierMap, sigma, targetMu)
+                        scheduleFrontierPick(frontierMap, sigma)
                       }}
+                      onPointerUp={(e) => applyFrontierPick(frontierMap, Number(e.currentTarget.value), true)}
                     />
-                  </Field>
-                  <Field label={`期待リターン（年率） ${pct(targetMu, 1)}`}>
-                    <input
-                      className="w-full accent-emerald-900"
-                      type="range"
-                      min={frontierMap.minMu}
-                      max={Math.max(frontierMap.maxMu, frontierMap.minMu + 1e-6)}
-                      step={0.0005}
-                      value={targetMu}
-                      onChange={(e) => {
-                        const mu = Number(e.target.value)
-                        setTargetMu(mu)
-                        scheduleFrontierPick(frontierMap, targetSigma, mu)
-                      }}
-                    />
+                    <div className="flex justify-between text-[11px] text-stone-400">
+                      <span>{pct(frontierMap.minSigma, 1)}</span>
+                      <span>{pct(frontierMap.maxSigma, 1)}</span>
+                    </div>
                   </Field>
                   {selectedPoint && (
-                    <p className="text-xs text-stone-500">
-                      近い効率的配分はリスク {pct(selectedPoint.sigma, 1)} ／ リターン {pct(selectedPoint.mu, 1)}。
-                      {chosen
-                        .map((a, i) => ((selectedPoint.weights[i] ?? 0) >= 0.005 ? `${a.name} ${pct(selectedPoint.weights[i] ?? 0, 0)}` : null))
-                        .filter(Boolean)
-                        .join(' / ')}
-                    </p>
+                    <div className="grid gap-3">
+                      <div className="rounded-lg bg-white/80 px-3 py-3">
+                        <div className="text-xs text-stone-500">このリスクでの期待リターン（年率）</div>
+                        <div className="text-2xl font-semibold tabular-nums">{pct(selectedPoint.mu, 1)}</div>
+                      </div>
+                      <AllocationDonut
+                        digits={1}
+                        items={chosen.map((a, i) => ({
+                          label: a.name,
+                          weight: selectedPoint.weights[i] ?? 0,
+                          color: allocColor(a.id, i),
+                        }))}
+                      />
+                    </div>
                   )}
                   <div className="grid gap-1.5 text-xs text-stone-600">
                     {chosen.map((a, i) => (
@@ -815,11 +812,11 @@ export default function App() {
                 </div>
               ) : (
                 <p className="text-xs text-stone-500">
-                  資産を選んで実行すると、共通期間の平均リターンとリスクの地図ができます。スライダーか図で目標を指定してください。
+                  資産を選んで実行すると、効率的フロンティアができます。予想リスクのバーで線上の配分がすぐ変わります。
                 </p>
               )}
               <p className="mt-3 text-xs text-stone-500">
-                期待値は信託報酬・為替方針込み、税引き前の月次リターンを年率換算したものです。将来の予測ではなく、選んだ共通期間の実績です。
+                期待値は信託報酬・為替方針込み、税引き前の月次リターンを年率換算したものです。将来の予測ではなく、選んだ共通期間の実績です。指定リスクはフロンティア線上の2点を線形補間します。
               </p>
             </Card>
           )}
@@ -903,7 +900,7 @@ export default function App() {
               {reverse
                 ? '目標金額を入れて逆算すると、税・信託報酬込みで必要な月額と配分が出ます。'
                 : frontier
-                  ? '資産を選んで実行すると、過去の平均リターンとリスクの地図から配分を選べます。'
+                  ? '資産を選んで実行すると、予想リスクのバーでフロンティア線上の配分を選べます。'
                   : '資産と投資条件を入れてシミュレーションすると、Worst / 中央値 / Sharpe で配分を評価できます。'}
             </div>
           )}
@@ -964,15 +961,14 @@ export default function App() {
                     assetNames={chosen.map((a) => a.name)}
                     assetColors={chosen.map((a, i) => allocColor(a.id, i))}
                     selected={selectedPoint}
-                    target={{ mu: targetMu, sigma: targetSigma }}
-                    onPick={(sigma, mu) => {
+                    targetSigma={targetSigma}
+                    onPick={(sigma) => {
                       setTargetSigma(sigma)
-                      setTargetMu(mu)
-                      scheduleFrontierPick(frontierMap, sigma, mu)
+                      scheduleFrontierPick(frontierMap, sigma)
                     }}
                   />
                   <p className="mt-2 text-xs text-stone-500">
-                    横軸が予想リスク、縦軸が期待リターン（年率）。緑が効率的フロンティア、点は探索した配分、色付きが各資産100%です。図をクリックするか、左のスライダーで指定してください。指定した組み合わせがフロンティア上にないときは、いちばん近い効率的配分を選びます。
+                    緑の線が効率的フロンティアです。予想リスク（横軸）のバーか図を左右に動かすと、線上の配分がすぐ変わります。期待リターンはその結果です。点は探索した配分、色付きが各資産100%です。
                   </p>
                 </Card>
               )}
@@ -1035,14 +1031,10 @@ export default function App() {
                   </div>
                 ) : frontier && selectedPoint ? (
                   <div>
-                    <p className="text-sm text-stone-500">選んだ配分の期待リターン / 予想リスク（年率・税引前）</p>
-                    <p className="text-4xl font-semibold tracking-tight text-stone-900 sm:text-5xl">
-                      {pct(selectedPoint.mu, 1)}
-                      <span className="mx-2 text-2xl font-normal text-stone-400">/</span>
-                      {pct(selectedPoint.sigma, 1)}
-                    </p>
+                    <p className="text-sm text-stone-500">フロンティア上の予想リスク（年率・税引前）</p>
+                    <p className="text-4xl font-semibold tracking-tight text-stone-900 sm:text-5xl">{pct(selectedPoint.sigma, 1)}</p>
                     <p className="mt-1 text-sm text-stone-600">
-                      指定 {pct(targetMu, 1)} / {pct(targetSigma, 1)} ／ 下の金額は Rolling の税引後手取り
+                      このリスクでの期待リターン {pct(selectedPoint.mu, 1)} ／ 下の金額は Rolling の税引後手取り
                     </p>
                   </div>
                 ) : exploreMode === 'minimax' ? (
@@ -1091,9 +1083,10 @@ export default function App() {
 
               <Card title="配分">
                 <AllocationDonut
+                  digits={frontier ? 1 : 0}
                   items={chosen.map((a, i) => ({
                     label: a.name,
-                    weight: best.weights[i] ?? 0,
+                    weight: (frontier && selectedPoint ? selectedPoint.weights[i] : best.weights[i]) ?? 0,
                     color: allocColor(a.id, i),
                   }))}
                 />

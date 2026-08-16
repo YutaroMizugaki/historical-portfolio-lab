@@ -1,6 +1,6 @@
 import { series, alignSelected } from '../src/data/load.ts'
 import { clipBounds, countAllocations } from '../src/engine/allocations.ts'
-import { buildFrontierMap, meanCov, monthlyAssetReturns, pickByRiskReturn, portMoments } from '../src/engine/frontier.ts'
+import { buildFrontierMap, meanCov, monthlyAssetReturns, pickByReturn, pickByRisk, portMoments } from '../src/engine/frontier.ts'
 import { evaluateWeights } from '../src/engine/simulate.ts'
 
 function assert(cond: unknown, msg: string) {
@@ -251,11 +251,25 @@ assert(hedgedSynthetic.windows[0]!.hedgeCostPaid > 0, 'hedge cost is reported')
   assert(map.frontier.length >= 2, `frontier ${map.frontier.length}`)
   assert(map.assets[0]!.mu > map.assets[1]!.mu, 'risky asset has higher mean')
   assert(map.assets[0]!.sigma > map.assets[1]!.sigma, 'risky asset has higher vol')
-  const conservative = pickByRiskReturn(map.frontier, map.minSigma, map.minMu)
-  const aggressive = pickByRiskReturn(map.frontier, map.maxSigma, map.maxMu)
+  const conservative = pickByReturn(map.frontier, map.minMu)
+  const aggressive = pickByReturn(map.frontier, map.maxMu)
   assert(conservative && aggressive, 'picks exist')
-  assert((conservative!.weights[1] ?? 0) > (conservative!.weights[0] ?? 0), `low-risk prefers calm ${conservative!.weights}`)
+  assert((conservative!.weights[1] ?? 0) > (conservative!.weights[0] ?? 0), `low-return prefers calm ${conservative!.weights}`)
   assert((aggressive!.weights[0] ?? 0) > (aggressive!.weights[1] ?? 0), `high-return prefers risky ${aggressive!.weights}`)
+  const midMu = (map.minMu + map.maxMu) / 2
+  const mid = pickByReturn(map.frontier, midMu)
+  assert(mid, 'mid pick')
+  assert(Math.abs(mid!.mu - midMu) < 1e-9, `mid stays on requested return ${mid!.mu} vs ${midMu}`)
+  assert(mid!.sigma >= conservative!.sigma - 1e-9 && mid!.sigma <= aggressive!.sigma + 1e-9, 'mid risk is between ends')
+  const byRiskLow = pickByRisk(map.frontier, map.minSigma)
+  const byRiskHigh = pickByRisk(map.frontier, map.maxSigma)
+  const byRiskMid = pickByRisk(map.frontier, (map.minSigma + map.maxSigma) / 2)
+  assert(byRiskLow && byRiskHigh && byRiskMid, 'risk picks exist')
+  assert((byRiskLow!.weights[1] ?? 0) > (byRiskLow!.weights[0] ?? 0), `low-risk prefers calm ${byRiskLow!.weights}`)
+  assert((byRiskHigh!.weights[0] ?? 0) > (byRiskHigh!.weights[1] ?? 0), `high-risk prefers risky ${byRiskHigh!.weights}`)
+  assert(Math.abs(byRiskMid!.sigma - (map.minSigma + map.maxSigma) / 2) < 1e-9, 'mid stays on requested risk')
+  assert(byRiskMid!.sigma > byRiskLow!.sigma && byRiskMid!.sigma < byRiskHigh!.sigma, 'risk slider moves along frontier')
+  assert(JSON.stringify(byRiskLow!.weights) !== JSON.stringify(byRiskHigh!.weights), 'risk bar changes mix')
   const rows = monthlyAssetReturns({
     returns: [high],
     expenseRatios: [0.012],

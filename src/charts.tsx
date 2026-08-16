@@ -10,7 +10,7 @@ const LINE = '#c4a35a'
 
 type PieItem = { label: string; weight: number; color: string }
 
-export function AllocationDonut({ items }: { items: PieItem[] }) {
+export function AllocationDonut({ items, digits = 0 }: { items: PieItem[]; digits?: number }) {
   const shown = items.filter((i) => i.weight >= 0.005)
   const r = 42
   const c = 2 * Math.PI * r
@@ -45,7 +45,7 @@ export function AllocationDonut({ items }: { items: PieItem[] }) {
           <li key={item.label} className="flex items-baseline gap-2">
             <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: item.color }} />
             <span className="min-w-0 flex-1 truncate">{item.label}</span>
-            <span className="text-lg font-semibold tabular-nums text-stone-900">{pct(item.weight, 0)}</span>
+            <span className="text-lg font-semibold tabular-nums text-stone-900">{pct(item.weight, digits)}</span>
           </li>
         ))}
       </ul>
@@ -344,7 +344,7 @@ export function FrontierChart({
   assetNames,
   assetColors,
   selected,
-  target,
+  targetSigma,
   onPick,
 }: {
   cloud: RiskReturnPoint[]
@@ -353,8 +353,8 @@ export function FrontierChart({
   assetNames: string[]
   assetColors: string[]
   selected: RiskReturnPoint | null
-  target: { mu: number; sigma: number }
-  onPick: (sigma: number, mu: number) => void
+  targetSigma: number
+  onPick: (sigma: number) => void
 }) {
   const w = 640
   const h = 280
@@ -371,31 +371,38 @@ export function FrontierChart({
     if (p.mu < minM) minM = p.mu
     if (p.mu > maxM) maxM = p.mu
   }
-  minS = Math.min(minS, target.sigma, 0)
-  maxS = Math.max(maxS, target.sigma)
-  minM = Math.min(minM, target.mu)
-  maxM = Math.max(maxM, target.mu)
+  minS = Math.min(minS, targetSigma, 0)
+  maxS = Math.max(maxS, targetSigma)
+  minM = Math.min(minM, selected?.mu ?? minM)
+  maxM = Math.max(maxM, selected?.mu ?? maxM)
   const sSpan = Math.max(1e-6, maxS - minS)
   const mSpan = Math.max(1e-6, maxM - minM)
   const xOf = (sigma: number) => pad.l + ((sigma - minS) / sSpan) * iw
   const yOf = (mu: number) => pad.t + ih - ((mu - minM) / mSpan) * ih
   const path = frontier.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xOf(p.sigma).toFixed(1)} ${yOf(p.mu).toFixed(1)}`).join(' ')
   const ticks = [0, 0.25, 0.5, 0.75, 1]
+  const sigmaFromEvent = (event: { clientX: number; currentTarget: SVGSVGElement }) => {
+    const box = event.currentTarget.getBoundingClientRect()
+    const px = ((event.clientX - box.left) / box.width) * w
+    return Math.max(minS, Math.min(maxS, minS + ((px - pad.l) / iw) * sSpan))
+  }
 
   return (
     <svg
       viewBox={`0 0 ${w} ${h}`}
-      className="w-full cursor-crosshair"
-      role="img"
-      aria-label="予想リスクと期待リターンの地図"
-      onClick={(event) => {
-        const svg = event.currentTarget
-        const box = svg.getBoundingClientRect()
-        const px = ((event.clientX - box.left) / box.width) * w
-        const py = ((event.clientY - box.top) / box.height) * h
-        const sigma = minS + ((px - pad.l) / iw) * sSpan
-        const mu = minM + ((pad.t + ih - py) / ih) * mSpan
-        onPick(Math.max(minS, Math.min(maxS, sigma)), Math.max(minM, Math.min(maxM, mu)))
+      className="w-full cursor-ew-resize touch-none"
+      role="slider"
+      aria-label="予想リスク。左右で効率的フロンティア上の配分を選びます"
+      aria-valuemin={minS}
+      aria-valuemax={maxS}
+      aria-valuenow={targetSigma}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture(event.pointerId)
+        onPick(sigmaFromEvent(event))
+      }}
+      onPointerMove={(event) => {
+        if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
+        onPick(sigmaFromEvent(event))
       }}
     >
       {ticks.map((t) => {
@@ -421,21 +428,12 @@ export function FrontierChart({
         </g>
       ))}
       <line
-        x1={xOf(target.sigma)}
-        x2={xOf(target.sigma)}
+        x1={xOf(targetSigma)}
+        x2={xOf(targetSigma)}
         y1={pad.t}
         y2={pad.t + ih}
         stroke={LINE}
-        strokeWidth="1"
-        strokeDasharray="4 3"
-      />
-      <line
-        x1={pad.l}
-        x2={pad.l + iw}
-        y1={yOf(target.mu)}
-        y2={yOf(target.mu)}
-        stroke={LINE}
-        strokeWidth="1"
+        strokeWidth="1.5"
         strokeDasharray="4 3"
       />
       {selected && (

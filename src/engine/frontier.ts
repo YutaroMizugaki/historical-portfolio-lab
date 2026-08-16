@@ -130,32 +130,39 @@ export function paretoFrontier(points: RiskReturnPoint[]): RiskReturnPoint[] {
   return out
 }
 
-export function pickByRiskReturn(points: RiskReturnPoint[], sigma: number, mu: number): RiskReturnPoint | null {
+export function pickAlong(points: RiskReturnPoint[], key: 'mu' | 'sigma', value: number): RiskReturnPoint | null {
   if (points.length === 0) return null
-  let minS = Infinity
-  let maxS = -Infinity
-  let minM = Infinity
-  let maxM = -Infinity
-  for (const p of points) {
-    if (p.sigma < minS) minS = p.sigma
-    if (p.sigma > maxS) maxS = p.sigma
-    if (p.mu < minM) minM = p.mu
-    if (p.mu > maxM) maxM = p.mu
+  const first = points[0]!
+  const last = points[points.length - 1]!
+  if (value <= first[key]) return copyPoint(first.weights, first.mu, first.sigma)
+  if (value >= last[key]) return copyPoint(last.weights, last.mu, last.sigma)
+  let lo = 0
+  let hi = points.length - 1
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (points[mid]![key] < value) lo = mid
+    else hi = mid - 1
   }
-  const sSpan = Math.max(1e-8, maxS - minS)
-  const mSpan = Math.max(1e-8, maxM - minM)
-  let best = points[0]!
-  let bestD = Infinity
-  for (const p of points) {
-    const ds = (p.sigma - sigma) / sSpan
-    const dm = (p.mu - mu) / mSpan
-    const d = ds * ds + dm * dm
-    if (d < bestD) {
-      bestD = d
-      best = p
-    }
+  const left = points[lo]!
+  const right = points[lo + 1] ?? left
+  const span = right[key] - left[key]
+  if (span <= 1e-12) return copyPoint(right.weights, right.mu, right.sigma)
+  const t = (value - left[key]) / span
+  const weights = left.weights.map((w, i) => w * (1 - t) + (right.weights[i] ?? 0) * t)
+  const sum = weights.reduce((s, w) => s + w, 0)
+  return {
+    weights: sum > 0 ? weights.map((w) => w / sum) : weights,
+    mu: left.mu * (1 - t) + right.mu * t,
+    sigma: left.sigma * (1 - t) + right.sigma * t,
   }
-  return best
+}
+
+export function pickByReturn(points: RiskReturnPoint[], mu: number): RiskReturnPoint | null {
+  return pickAlong(points, 'mu', mu)
+}
+
+export function pickByRisk(points: RiskReturnPoint[], sigma: number): RiskReturnPoint | null {
+  return pickAlong(points, 'sigma', sigma)
 }
 
 export function buildFrontierMap(req: FrontierRequest): FrontierMap {

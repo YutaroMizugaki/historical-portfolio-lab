@@ -15,6 +15,8 @@ import type {
   Candidate,
   CostModel,
   Currency,
+  EvaluationBasis,
+  HedgeMode,
   OptimizeMode,
   OptimizeProgress,
   OptimizeResponse,
@@ -71,6 +73,8 @@ export default function App() {
   const [years, setYears] = useState(10)
   const [customYears, setCustomYears] = useState('')
   const [currency, setCurrency] = useState<Currency>('JPY')
+  const [evaluationBasis, setEvaluationBasis] = useState<EvaluationBasis>('nominal')
+  const [hedgeMode, setHedgeMode] = useState<HedgeMode>('unhedged')
   const [rebalance, setRebalance] = useState<Rebalance>('annual')
   const [exploreMode, setExploreMode] = useState<ScoreMode>('minimax')
   const [reverseMode, setReverseMode] = useState<OptimizeMode>('minContribution')
@@ -107,7 +111,15 @@ export default function App() {
     [chosen, terOverrides, taxRate, txnCostPct, purchaseCostPct],
   )
 
-  const aligned = useMemo(() => alignSelected(chosen, currency), [chosen, currency])
+  const effectiveBasis: EvaluationBasis = currency === 'JPY' ? evaluationBasis : 'nominal'
+  const aligned = useMemo(
+    () =>
+      alignSelected(chosen, currency, {
+        requireCpi: effectiveBasis === 'real',
+        requireHedge: true,
+      }),
+    [chosen, currency, effectiveBasis],
+  )
   const periodYears = customYears ? Number(customYears) || years : years
   const periodMonths = Math.round(periodYears * 12)
   const windowCount =
@@ -200,6 +212,11 @@ export default function App() {
       liquidate: true,
       fxReturns: aligned.fxReturns,
       foreign: aligned.foreign,
+      hedgeReturns: aligned.hedgeReturns,
+      hedgeMode,
+      evaluationBasis: effectiveBasis,
+      cpiLevels: effectiveBasis === 'real' ? aligned.cpiLevels : undefined,
+      cpiReference: effectiveBasis === 'real' ? (aligned.cpiReference ?? undefined) : undefined,
     })
   }
 
@@ -222,10 +239,15 @@ export default function App() {
       true,
       aligned.fxReturns,
       aligned.foreign,
+      aligned.hedgeReturns,
+      hedgeMode,
+      effectiveBasis,
+      aligned.cpiLevels,
+      aligned.cpiReference ?? undefined,
     )
-  }, [aligned, best, picked, periodMonths, initial, displayMonthly, rebalance, costs])
+  }, [aligned, best, picked, periodMonths, initial, displayMonthly, rebalance, costs, hedgeMode, effectiveBasis])
 
-  const hedgedPath = useMemo(() => {
+  const comparisonPath = useMemo(() => {
     if (!best || picked == null || !best.windows[picked] || !aligned.localReturns.length) return null
     if (!aligned.foreign.some(Boolean)) return null
     const start = aligned.dates.indexOf(best.windows[picked].start)
@@ -241,8 +263,15 @@ export default function App() {
       rebalanceEveryMonths(rebalance),
       costs,
       true,
+      aligned.fxReturns,
+      aligned.foreign,
+      aligned.hedgeReturns,
+      hedgeMode === 'hedged' ? 'unhedged' : 'hedged',
+      effectiveBasis,
+      aligned.cpiLevels,
+      aligned.cpiReference ?? undefined,
     )
-  }, [aligned, best, picked, periodMonths, initial, displayMonthly, rebalance, costs])
+  }, [aligned, best, picked, periodMonths, initial, displayMonthly, rebalance, costs, hedgeMode, effectiveBasis])
 
   const fxReport = useMemo(() => {
     if (!best || !aligned.localReturns.length) return null
@@ -250,6 +279,7 @@ export default function App() {
       unhedgedReturns: aligned.returns,
       hedgedReturns: aligned.localReturns,
       fxReturns: aligned.fxReturns,
+      hedgeReturns: aligned.hedgeReturns,
       foreign: aligned.foreign,
       weights: best.weights,
       dates: aligned.dates,
@@ -261,8 +291,11 @@ export default function App() {
       target: reverse ? target : 0,
       costs,
       liquidate: true,
+      evaluationBasis: effectiveBasis,
+      cpiLevels: aligned.cpiLevels,
+      cpiReference: aligned.cpiReference ?? undefined,
     })
-  }, [aligned, best, periodMonths, rebalance, initial, displayMonthly, reverse, target, costs])
+  }, [aligned, best, periodMonths, rebalance, initial, displayMonthly, reverse, target, costs, effectiveBasis])
 
   const windowFx = useMemo(() => {
     if (!best || picked == null || !best.windows[picked]) return null
@@ -277,6 +310,7 @@ export default function App() {
   const mixedReturnTypes = new Set(chosen.map((a) => a.returnType)).size > 1
   const taxLabel =
     taxAccount === 'nisa' ? 'NISA 0%' : taxAccount === 'tokutei' ? '特定口座 20.315%' : `税率 ${customTax}%`
+  const amountBasisLabel = effectiveBasis === 'real' ? '現在の購買力' : '名目'
 
   return (
     <div className="min-h-svh">
@@ -293,7 +327,8 @@ export default function App() {
             <Badge>{taxLabel}</Badge>
             <Badge>信託報酬あり</Badge>
             <Badge>期末売却課税</Badge>
-            <Badge>為替変動込み</Badge>
+            <Badge>{amountBasisLabel}</Badge>
+            <Badge>{hedgeMode === 'hedged' ? '為替ヘッジあり' : '為替変動込み'}</Badge>
           </div>
         </div>
       </header>
@@ -393,9 +428,45 @@ export default function App() {
                 />
               </Field>
               <Field label="基準通貨">
-                <select className={inputClass} value={currency} onChange={(e) => setCurrency(e.target.value as Currency)}>
+                <select
+                  className={inputClass}
+                  value={currency}
+                  onChange={(e) => {
+                    const next = e.target.value as Currency
+                    setCurrency(next)
+                    if (next === 'USD') setEvaluationBasis('nominal')
+                    setResult(null)
+                  }}
+                >
                   <option value="JPY">JPY</option>
                   <option value="USD">USD</option>
+                </select>
+              </Field>
+              <Field label="金額の基準">
+                <select
+                  className={inputClass}
+                  value={effectiveBasis}
+                  disabled={currency !== 'JPY'}
+                  onChange={(e) => {
+                    setEvaluationBasis(e.target.value as EvaluationBasis)
+                    setResult(null)
+                  }}
+                >
+                  <option value="nominal">名目金額</option>
+                  <option value="real">実質（現在の購買力）</option>
+                </select>
+              </Field>
+              <Field label="外貨">
+                <select
+                  className={inputClass}
+                  value={hedgeMode}
+                  onChange={(e) => {
+                    setHedgeMode(e.target.value as HedgeMode)
+                    setResult(null)
+                  }}
+                >
+                  <option value="unhedged">ヘッジなし</option>
+                  <option value="hedged">ヘッジあり（推定コスト込）</option>
                 </select>
               </Field>
               <Field label="投資期間">
@@ -443,9 +514,16 @@ export default function App() {
               データ期間 {aligned.start ? `${ymLabel(aligned.start)} – ${ymLabel(aligned.end ?? '')}` : '（資産の共通期間なし）'} ／
               Rolling {windowCount} 本
               {aligned.foreign.some(Boolean)
-                ? ` ／ ドル資産は毎月のUSDJPYで${currency === 'JPY' ? '円' : 'ドル'}評価`
+                ? hedgeMode === 'hedged'
+                  ? ' ／ 外貨資産はCIP推定ヘッジ収益を反映'
+                  : ` ／ ドル資産は毎月のUSDJPYで${currency === 'JPY' ? '円' : 'ドル'}評価`
                 : ''}
             </p>
+            {effectiveBasis === 'real' && (
+              <p className="mt-1 text-xs text-stone-500">
+                入力額と結果はCPI最新月（{series.inflation?.JPY.at(-1)?.[0] ?? '不明'}）の購買力。積立額も各月のCPIで当時の名目額へ換算します。
+              </p>
+            )}
           </Card>
 
           <Card title="税金とコスト">
@@ -512,7 +590,7 @@ export default function App() {
           {workspace === 'reverse' && (
             <Card title="目標逆算">
               <div className="grid gap-3">
-                <Field label="目標金額（期末の税引後手取り）">
+                <Field label={`目標金額（税引後・${amountBasisLabel}）`}>
                   <input className={inputClass} type="number" min={0} value={target} onChange={(e) => setTarget(Number(e.target.value))} />
                 </Field>
                 <div className="grid gap-2">
@@ -689,7 +767,7 @@ export default function App() {
               <section className="rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-5">
                 {reverse && mode === 'minContribution' ? (
                   <div>
-                    <p className="text-sm text-stone-500">どの開始年からでも目標に届く、毎月の積立</p>
+                    <p className="text-sm text-stone-500">どの開始年からでも目標に届く、毎月の積立（{amountBasisLabel}）</p>
                     <div className="mt-1 flex flex-wrap items-end gap-3">
                       <Amount n={best.requiredMonthly} currency={currency} size="hero" suffix="/月" />
                       <p className="mb-1 text-sm text-stone-600">
@@ -699,7 +777,7 @@ export default function App() {
                   </div>
                 ) : reverse ? (
                   <div>
-                    <p className="text-sm text-stone-500">指定した積立で、目標に届いた割合</p>
+                    <p className="text-sm text-stone-500">指定した積立で、目標に届いた割合（{amountBasisLabel}）</p>
                     <div className="mt-1 flex flex-wrap items-end gap-3">
                       <p className="text-4xl font-semibold tracking-tight text-stone-900 sm:text-5xl">{pct(best.successRate, 0)}</p>
                       <p className="mb-1 text-sm text-stone-600">
@@ -709,7 +787,7 @@ export default function App() {
                   </div>
                 ) : exploreMode === 'minimax' ? (
                   <div>
-                    <p className="text-sm text-stone-500">最悪期間の税引後手取り</p>
+                    <p className="text-sm text-stone-500">最悪期間の税引後手取り（{amountBasisLabel}）</p>
                     <Amount n={best.worst} currency={currency} size="hero" />
                   </div>
                 ) : exploreMode === 'sharpe' ? (
@@ -719,7 +797,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div>
-                    <p className="text-sm text-stone-500">よくある期間の税引後手取り</p>
+                    <p className="text-sm text-stone-500">よくある期間の税引後手取り（{amountBasisLabel}）</p>
                     <Amount n={best.median} currency={currency} size="hero" />
                   </div>
                 )}
@@ -763,7 +841,7 @@ export default function App() {
 
               {fxReport && (
                 <Card title="為替リスク">
-                  <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                     <div className="rounded-lg bg-white/80 px-3 py-3">
                       <div className="text-xs text-stone-500">外貨の比率</div>
                       <div className="text-2xl font-semibold tabular-nums">{pct(fxReport.foreignWeight, 0)}</div>
@@ -778,6 +856,13 @@ export default function App() {
                       <div className="text-2xl font-semibold tabular-nums">{signedAmount(fxReport.medianFxImpact, currency)}</div>
                       <div className="mt-1 text-xs text-stone-500">ヘッジなし − ヘッジあり</div>
                     </div>
+                    <div className="rounded-lg bg-white/80 px-3 py-3">
+                      <div className="text-xs text-stone-500">推定ヘッジコスト（年率）</div>
+                      <div className="text-2xl font-semibold tabular-nums">{pct(fxReport.hedgeCostAnnual, 1)}</div>
+                      <div className="mt-1 text-xs text-stone-500">
+                        中央期間の累計 {amountPrimary(fxReport.hedgeCostPaidMedian, currency)}
+                      </div>
+                    </div>
                   </div>
                   <div className="mt-4 overflow-x-auto">
                     <table className="w-full text-sm">
@@ -791,13 +876,17 @@ export default function App() {
                       </thead>
                       <tbody>
                         <tr className="border-b border-stone-100">
-                          <td className="py-2 pr-3 font-medium">ヘッジなし（実際）</td>
-                          <td className="py-2 pr-3 text-right tabular-nums">{amountPrimary(best.worst, currency)}</td>
-                          <td className="py-2 pr-3 text-right tabular-nums">{amountPrimary(best.median, currency)}</td>
+                          <td className="py-2 pr-3 font-medium">
+                            ヘッジなし{hedgeMode === 'unhedged' ? '（選択中）' : ''}
+                          </td>
+                          <td className="py-2 pr-3 text-right tabular-nums">{amountPrimary(fxReport.unhedgedWorst, currency)}</td>
+                          <td className="py-2 pr-3 text-right tabular-nums">{amountPrimary(fxReport.unhedgedMedian, currency)}</td>
                           <td className="py-2 text-right tabular-nums">{pct(fxReport.unhedgedVol, 0)}</td>
                         </tr>
                         <tr>
-                          <td className="py-2 pr-3 font-medium">為替ヘッジあり</td>
+                          <td className="py-2 pr-3 font-medium">
+                            為替ヘッジあり{hedgeMode === 'hedged' ? '（選択中）' : ''}
+                          </td>
                           <td className="py-2 pr-3 text-right tabular-nums">{amountPrimary(fxReport.hedgedWorst, currency)}</td>
                           <td className="py-2 pr-3 text-right tabular-nums">{amountPrimary(fxReport.hedgedMedian, currency)}</td>
                           <td className="py-2 text-right tabular-nums">{pct(fxReport.hedgedVol, 0)}</td>
@@ -813,23 +902,23 @@ export default function App() {
                     為替との相関 {fxReport.fxCorr.toFixed(2)}。
                   </p>
                   <p className="mt-1 text-xs text-stone-500">
-                    ヘッジありは現地通貨リターンの完全ヘッジ近似です。ヘッジコスト・ロールコストは未計上。探索も推移も毎月の為替を掛けています。
+                    ヘッジありは日米1年公的金利差から算出したCIP推定です。通貨ベーシス、フォワードの売買スプレッド、実際のロール価格は含みません。
                   </p>
                 </Card>
               )}
 
-              <Card title="いくらで終わったか（税引後）">
+              <Card title={`いくらで終わったか（税引後・${amountBasisLabel}）`}>
                 <Histogram
                   values={best.windows.map((w) => w.final)}
                   target={reverse ? target : null}
                   currency={currency}
                 />
-                <p className="mt-1 text-xs text-stone-500">期末に全売却した手取りです。為替込み、単位は万円。</p>
+                <p className="mt-1 text-xs text-stone-500">期末に全売却した手取りです。選択した為替方針を反映、単位は万円。</p>
               </Card>
 
-              <Card title="開始年ごとの手取り">
+              <Card title={`開始年ごとの手取り（${amountBasisLabel}）`}>
                 <p className="mb-2 text-xs text-stone-500">
-                  行をクリックすると、その期間の推移を表示します。金額は為替込み。
+                  行をクリックすると、その期間の推移を表示します。金額は選択した為替方針と{amountBasisLabel}を反映。
                   {best.windows.some((w) => w.fxImpact !== 0) ? ' 「為替」はヘッジなしとヘッジありの税引後差額です。' : ''}
                 </p>
                 <RollingBars
@@ -847,6 +936,13 @@ export default function App() {
                     <Metric label="税引後手取り" n={best.windows[picked].afterTax} currency={currency} />
                     <Metric label="売却前の評価額" n={best.windows[picked].market} currency={currency} />
                     <Metric label="払った税" n={best.windows[picked].taxPaid} currency={currency} />
+                    {hedgeMode === 'hedged' && best.windows[picked].hedgeCostPaid > 0 && (
+                      <Metric
+                        label="推定ヘッジコスト"
+                        n={best.windows[picked].hedgeCostPaid}
+                        currency={currency}
+                      />
+                    )}
                     <div className="rounded-lg bg-white/80 px-3 py-3">
                       <div className="text-xs text-stone-500">最大下落</div>
                       <div className="text-xl font-semibold tabular-nums">{pct(path.maxDrawdown, 1)}</div>
@@ -867,12 +963,14 @@ export default function App() {
                     dates={path.dates}
                     portfolio={path.portfolio}
                     principal={path.principal}
-                    hedged={hedgedPath?.portfolio}
+                    hedged={comparisonPath?.portfolio}
                     currency={currency}
+                    primaryLabel={hedgeMode === 'hedged' ? 'ヘッジあり' : 'ヘッジなし'}
+                    comparisonLabel={hedgeMode === 'hedged' ? 'ヘッジなし' : 'ヘッジあり'}
                   />
                   {windowFx && (
                     <p className="mt-2 text-xs text-stone-500">
-                      この期間のドル円 {windowFx.start.toFixed(1)} → {windowFx.end.toFixed(1)}（{pct(windowFx.change, 1)}）。緑の線が為替込みの評価額です。
+                      この期間のドル円 {windowFx.start.toFixed(1)} → {windowFx.end.toFixed(1)}（{pct(windowFx.change, 1)}）。緑の線が選択中の為替方針です。
                     </p>
                   )}
                 </Card>
@@ -901,9 +999,18 @@ export default function App() {
                   ))}
                 </ul>
                 <p className="mt-3 text-xs text-stone-500">
-                  過去の到達は将来を保証しません。ドル資産は毎月のUSDJPYを反映。{taxLabel}。売買 {txnCostPct}% / 積立手数料 {purchaseCostPct}% 。
+                  過去の到達は将来を保証しません。評価は{amountBasisLabel}、外貨は
+                  {hedgeMode === 'hedged' ? 'CIP推定ヘッジコスト込み' : '毎月のUSDJPY込み'}。{taxLabel}。売買 {txnCostPct}% / 積立手数料 {purchaseCostPct}% 。
                   損失の翌年繰越は未反映。データ取得日 {series.meta.fetchedAt}。探索 {result.searched.toLocaleString()} 配分。
                 </p>
+                {effectiveBasis === 'real' && series.inflation && (
+                  <p className="mt-1 text-xs text-stone-500">
+                    CPI: {series.inflation.source} 基準 {series.inflation.base}。金額は最新月の購買力へ換算。
+                  </p>
+                )}
+                {hedgeMode === 'hedged' && series.fx.hedgeSource && (
+                  <p className="mt-1 text-xs text-stone-500">為替ヘッジ: {series.fx.hedgeSource}</p>
+                )}
               </Card>
             </>
           )}

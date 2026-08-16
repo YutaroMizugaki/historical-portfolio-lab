@@ -7,6 +7,8 @@ export type ScoreMode = 'minimax' | 'median' | 'sharpe'
 export type Rebalance = 'none' | 'monthly' | 'quarterly' | 'semiannual' | 'annual'
 export type Workspace = 'explore' | 'reverse'
 export type TaxAccount = 'tokutei' | 'nisa' | 'custom'
+export type EvaluationBasis = 'nominal' | 'real'
+export type HedgeMode = 'unhedged' | 'hedged'
 
 export type Point = readonly [date: string, value: number]
 
@@ -24,7 +26,16 @@ export type Asset = {
 
 export type SeriesFile = {
   meta: { fetchedAt: string; notes: string[] }
-  fx: { USDJPY: Point[] }
+  fx: {
+    USDJPY: Point[]
+    hedgeReturnJPY?: Point[]
+    hedgeSource?: string
+  }
+  inflation?: {
+    JPY: Point[]
+    base: string
+    source: string
+  }
   assets: Asset[]
 }
 
@@ -47,6 +58,7 @@ export type WindowResult = {
   taxPaid: number
   feePaid: number
   fxImpact: number
+  hedgeCostPaid: number
 }
 
 export type Candidate = {
@@ -83,6 +95,11 @@ export type OptimizeRequest = {
   liquidate: boolean
   fxReturns: number[]
   foreign: boolean[]
+  hedgeReturns?: number[]
+  hedgeMode?: HedgeMode
+  evaluationBasis?: EvaluationBasis
+  cpiLevels?: number[]
+  cpiReference?: number
 }
 
 export type OptimizeProgress = {
@@ -113,6 +130,7 @@ export type PathResult = {
   taxPaid: number
   feePaid: number
   fxPnl: number
+  hedgeCostPaid: number
 }
 
 export type FxReport = {
@@ -126,7 +144,12 @@ export type FxReport = {
   medianFxImpact: number
   worstFxImpact: number
   worstFxStart: string
+  unhedgedWorst: number
+  unhedgedMedian: number
+  unhedgedBest: number
   hedgedWorst: number
   hedgedMedian: number
   hedgedBest: number
+  hedgeCostAnnual: number
+  hedgeCostPaidMedian: number
 }

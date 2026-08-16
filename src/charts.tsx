@@ -187,12 +187,16 @@ export function WealthChart({
   principal,
   hedged,
   currency,
+  primaryLabel = '為替込み',
+  comparisonLabel = '為替ヘッジあり',
 }: {
   dates: string[]
   portfolio: number[]
   principal: number[]
   hedged?: number[]
   currency: Currency
+  primaryLabel?: string
+  comparisonLabel?: string
 }) {
   const n = portfolio.length
   if (n < 2) return null
@@ -213,11 +217,11 @@ export function WealthChart({
       )}
       <path d={line(portfolio)} fill="none" stroke={GOOD} strokeWidth="2.2" />
       <text x={pad.l} y={14} fill={GOOD} fontSize="12" fontWeight="600">
-        為替込み
+        {primaryLabel}
       </text>
       {hedged && (
         <text x={pad.l + 72} y={14} fill={LINE} fontSize="12" fontWeight="600">
-          為替ヘッジあり
+          {comparisonLabel}
         </text>
       )}
       <text x={pad.l + (hedged ? 168 : 72)} y={14} fill="#78716c" fontSize="12">

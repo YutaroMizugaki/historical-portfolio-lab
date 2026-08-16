@@ -1,4 +1,4 @@
-import type { CostModel, PathResult, Rebalance, WindowResult } from '../types'
+import type { CostModel, EvaluationBasis, HedgeMode, PathResult, Rebalance, WindowResult } from '../types.ts'
 
 export function rebalanceEveryMonths(r: Rebalance): number {
   if (r === 'monthly') return 1
@@ -88,19 +88,28 @@ function growHoldings(
   costs: CostModel,
   fxReturns: number[] | undefined,
   foreign: boolean[] | undefined,
-): number {
+  hedgeReturns: number[] | undefined,
+  hedgeMode: HedgeMode,
+): { fxPnl: number; hedgeCost: number } {
   let fxPnl = 0
+  let hedgeCost = 0
   for (let i = 0; i < values.length; i += 1) {
     const loc = returns[i]![t]!
-    const fxR = foreign?.[i] ? (fxReturns?.[t] ?? 0) : 0
+    const foreignAsset = Boolean(foreign?.[i])
+    const fxR = foreignAsset
+      ? hedgeMode === 'hedged'
+        ? (hedgeReturns?.[t] ?? 0)
+        : (fxReturns?.[t] ?? 0)
+      : 0
     const afterLocal = values[i] * (1 + loc)
     const ter = costs.expenseRatios[i] ?? 0
     const afterTer = ter > 0 ? afterLocal * (1 - ter / 12) : afterLocal
     const afterFx = afterTer * (1 + fxR)
     fxPnl += afterFx - afterTer
+    if (foreignAsset && hedgeMode === 'hedged' && fxR < 0) hedgeCost += -afterTer * fxR
     values[i] = afterFx
   }
-  return fxPnl
+  return { fxPnl, hedgeCost }
 }
 
 function liquidate(values: Float64Array, basis: Float64Array, taxRate: number, txnCost: number): {
@@ -135,6 +144,11 @@ export type RunConfig = {
   basis: Float64Array
   fxReturns?: number[]
   foreign?: boolean[]
+  hedgeReturns?: number[]
+  hedgeMode?: HedgeMode
+  evaluationBasis?: EvaluationBasis
+  cpiLevels?: number[]
+  cpiReference?: number
 }
 
 export function runWindow(cfg: RunConfig): {
@@ -144,6 +158,7 @@ export function runWindow(cfg: RunConfig): {
   taxPaid: number
   feePaid: number
   fxPnl: number
+  hedgeCostPaid: number
   path: PathResult | null
 } {
   const { returns, weights, t0, horizon, initial, contrib, rebalEvery, costs, values, basis } = cfg
@@ -153,34 +168,64 @@ export function runWindow(cfg: RunConfig): {
   let taxPaid = 0
   let feePaid = 0
   let fxPnl = 0
+  let hedgeCostPaid = 0
+  const real = cfg.evaluationBasis === 'real'
+  const cpiReference = cfg.cpiReference ?? 0
+  const inputScale = (index: number) => {
+    const cpi = cfg.cpiLevels?.[index] ?? 0
+    return real && cpi > 0 && cpiReference > 0 ? cpi / cpiReference : 1
+  }
+  const outputScale = (index: number) => {
+    const cpi = cfg.cpiLevels?.[index] ?? 0
+    return real && cpi > 0 && cpiReference > 0 ? cpiReference / cpi : 1
+  }
+  const initialNominal = initial * inputScale(t0)
 
-  for (let i = 0; i < n; i += 1) feePaid += buy(values, basis, i, initial * weights[i], costs.purchaseCost)
+  for (let i = 0; i < n; i += 1) {
+    feePaid += buy(values, basis, i, initialNominal * weights[i], costs.purchaseCost) * outputScale(t0)
+  }
 
   const outDates: string[] = []
   const portfolio: number[] = []
   const principal: number[] = []
   if (cfg.recordPath && cfg.dates) {
     outDates.push(t0 === 0 ? cfg.dates[0]! : cfg.dates[t0 - 1] ?? cfg.dates[0]!)
-    portfolio.push(sum(values))
+    portfolio.push(sum(values) * outputScale(t0))
     principal.push(initial)
   }
 
-  let peak = sum(values)
+  let peak = sum(values) * outputScale(t0)
   let maxDrawdown = 0
   let paid = initial
 
   for (let t = 0; t < horizon; t += 1) {
-    fxPnl += growHoldings(values, returns, t0 + t, costs, cfg.fxReturns, cfg.foreign)
+    const valueIndex = t0 + t + 1
+    const growth = growHoldings(
+      values,
+      returns,
+      t0 + t,
+      costs,
+      cfg.fxReturns,
+      cfg.foreign,
+      cfg.hedgeReturns,
+      cfg.hedgeMode ?? 'unhedged',
+    )
+    fxPnl += growth.fxPnl * outputScale(valueIndex)
+    hedgeCostPaid += growth.hedgeCost * outputScale(valueIndex)
     if (contrib > 0) {
-      for (let i = 0; i < n; i += 1) feePaid += buy(values, basis, i, contrib * weights[i], costs.purchaseCost)
+      const contributionNominal = contrib * inputScale(valueIndex)
+      for (let i = 0; i < n; i += 1) {
+        feePaid +=
+          buy(values, basis, i, contributionNominal * weights[i], costs.purchaseCost) * outputScale(valueIndex)
+      }
       paid += contrib
     }
     if (rebalEvery > 0 && (t + 1) % rebalEvery === 0) {
       const r = rebalanceTaxed(values, basis, weights, costs.taxRate, costs.txnCost)
-      taxPaid += r.tax
-      feePaid += r.fees
+      taxPaid += r.tax * outputScale(valueIndex)
+      feePaid += r.fees * outputScale(valueIndex)
     }
-    const total = sum(values)
+    const total = sum(values) * outputScale(valueIndex)
     if (total > peak) peak = total
     if (peak > 0) {
       const dd = total / peak - 1
@@ -193,19 +238,21 @@ export function runWindow(cfg: RunConfig): {
     }
   }
 
-  const market = sum(values)
+  const endIndex = t0 + horizon
+  const marketNominal = sum(values)
+  const market = marketNominal * outputScale(endIndex)
   let afterTax = market
   if (cfg.liquidateEnd) {
     const end = liquidate(values, basis, costs.taxRate, costs.txnCost)
-    afterTax = end.afterTax
-    taxPaid += end.tax
-    feePaid += end.fees
+    afterTax = end.afterTax * outputScale(endIndex)
+    taxPaid += end.tax * outputScale(endIndex)
+    feePaid += end.fees * outputScale(endIndex)
   }
 
   const path: PathResult | null = cfg.recordPath
-    ? { dates: outDates, portfolio, principal, maxDrawdown, market, afterTax, taxPaid, feePaid, fxPnl }
+    ? { dates: outDates, portfolio, principal, maxDrawdown, market, afterTax, taxPaid, feePaid, fxPnl, hedgeCostPaid }
     : null
-  return { market, afterTax, maxDrawdown, taxPaid, feePaid, fxPnl, path }
+  return { market, afterTax, maxDrawdown, taxPaid, feePaid, fxPnl, hedgeCostPaid, path }
 }
 
 function reportedFinal(market: number, afterTax: number, liquidateEnd: boolean): number {
@@ -227,6 +274,11 @@ export function windowSucceeds(
   basis: Float64Array,
   fxReturns?: number[],
   foreign?: boolean[],
+  hedgeReturns?: number[],
+  hedgeMode: HedgeMode = 'unhedged',
+  evaluationBasis: EvaluationBasis = 'nominal',
+  cpiLevels?: number[],
+  cpiReference?: number,
 ): boolean {
   const r = runWindow({
     returns,
@@ -242,6 +294,11 @@ export function windowSucceeds(
     basis,
     fxReturns,
     foreign,
+    hedgeReturns,
+    hedgeMode,
+    evaluationBasis,
+    cpiLevels,
+    cpiReference,
   })
   return reportedFinal(r.market, r.afterTax, liquidateEnd) + 1e-6 >= target
 }
@@ -258,6 +315,11 @@ export function minMonthlyContribution(
   liquidateEnd: boolean,
   fxReturns?: number[],
   foreign?: boolean[],
+  hedgeReturns?: number[],
+  hedgeMode: HedgeMode = 'unhedged',
+  evaluationBasis: EvaluationBasis = 'nominal',
+  cpiLevels?: number[],
+  cpiReference?: number,
 ): number {
   const n = weightsArr.length
   const weights = Float64Array.from(weightsArr)
@@ -283,6 +345,11 @@ export function minMonthlyContribution(
           basis,
           fxReturns,
           foreign,
+          hedgeReturns,
+          hedgeMode,
+          evaluationBasis,
+          cpiLevels,
+          cpiReference,
         )
       ) {
         return false
@@ -323,6 +390,11 @@ export function simulatePath(
   liquidateEnd: boolean,
   fxReturns?: number[],
   foreign?: boolean[],
+  hedgeReturns?: number[],
+  hedgeMode: HedgeMode = 'unhedged',
+  evaluationBasis: EvaluationBasis = 'nominal',
+  cpiLevels?: number[],
+  cpiReference?: number,
 ): PathResult {
   const n = weightsArr.length
   const r = runWindow({
@@ -341,6 +413,11 @@ export function simulatePath(
     basis: new Float64Array(n),
     fxReturns,
     foreign,
+    hedgeReturns,
+    hedgeMode,
+    evaluationBasis,
+    cpiLevels,
+    cpiReference,
   })
   return r.path!
 }
@@ -360,6 +437,10 @@ export function sharpeOfWeights(
   costs: CostModel,
   fxReturns?: number[],
   foreign?: boolean[],
+  hedgeReturns?: number[],
+  hedgeMode: HedgeMode = 'unhedged',
+  cpiReturns?: number[],
+  evaluationBasis: EvaluationBasis = 'nominal',
 ): number {
   const n = weights.length
   const tLen = returns[0]?.length ?? 0
@@ -371,12 +452,13 @@ export function sharpeOfWeights(
   const excess = new Float64Array(tLen)
   let prev = sum(values)
   for (let t = 0; t < tLen; t += 1) {
-    growHoldings(values, returns, t, costs, fxReturns, foreign)
+    growHoldings(values, returns, t, costs, fxReturns, foreign, hedgeReturns, hedgeMode)
     if (rebalEvery > 0 && (t + 1) % rebalEvery === 0) {
       rebalanceTaxed(values, basis, weights, costs.taxRate, costs.txnCost)
     }
     const total = sum(values)
-    const r = prev <= 0 ? 0 : total / prev - 1
+    let r = prev <= 0 ? 0 : total / prev - 1
+    if (evaluationBasis === 'real') r = (1 + r) / (1 + (cpiReturns?.[t] ?? 0)) - 1
     excess[t] = r - rf
     prev = total
   }
@@ -411,6 +493,12 @@ export type EvaluateInput = {
   computeRequired: boolean
   fxReturns?: number[]
   foreign?: boolean[]
+  hedgeReturns?: number[]
+  hedgeMode?: HedgeMode
+  evaluationBasis?: EvaluationBasis
+  cpiLevels?: number[]
+  cpiReturns?: number[]
+  cpiReference?: number
 }
 
 export function evaluateWeights(input: EvaluateInput): {
@@ -443,6 +531,11 @@ export function evaluateWeights(input: EvaluateInput): {
         input.liquidate,
         input.fxReturns,
         input.foreign,
+        input.hedgeReturns,
+        input.hedgeMode,
+        input.evaluationBasis,
+        input.cpiLevels,
+        input.cpiReference,
       )
     : 0
   const contrib = input.computeRequired ? requiredMonthly : input.monthly
@@ -471,6 +564,11 @@ export function evaluateWeights(input: EvaluateInput): {
       basis,
       fxReturns: input.fxReturns,
       foreign: input.foreign,
+      hedgeReturns: input.hedgeReturns,
+      hedgeMode: input.hedgeMode,
+      evaluationBasis: input.evaluationBasis,
+      cpiLevels: input.cpiLevels,
+      cpiReference: input.cpiReference,
     })
     const final = reportedFinal(r.market, r.afterTax, input.liquidate)
     finals.push(final)
@@ -488,7 +586,8 @@ export function evaluateWeights(input: EvaluateInput): {
     if (input.withWindows) {
       let fxImpact = 0
       if (hasFx) {
-        const hedged = runWindow({
+        const oppositeMode: HedgeMode = input.hedgeMode === 'hedged' ? 'unhedged' : 'hedged'
+        const opposite = runWindow({
           returns: input.returns,
           weights,
           t0,
@@ -500,8 +599,16 @@ export function evaluateWeights(input: EvaluateInput): {
           liquidateEnd: input.liquidate,
           values,
           basis,
+          fxReturns: input.fxReturns,
+          foreign: input.foreign,
+          hedgeReturns: input.hedgeReturns,
+          hedgeMode: oppositeMode,
+          evaluationBasis: input.evaluationBasis,
+          cpiLevels: input.cpiLevels,
+          cpiReference: input.cpiReference,
         })
-        fxImpact = final - reportedFinal(hedged.market, hedged.afterTax, input.liquidate)
+        const oppositeFinal = reportedFinal(opposite.market, opposite.afterTax, input.liquidate)
+        fxImpact = input.hedgeMode === 'hedged' ? oppositeFinal - final : final - oppositeFinal
       }
       windows.push({
         start,
@@ -515,6 +622,7 @@ export function evaluateWeights(input: EvaluateInput): {
         taxPaid: r.taxPaid,
         feePaid: r.feePaid,
         fxImpact,
+        hedgeCostPaid: r.hedgeCostPaid,
       })
     }
   }
@@ -534,6 +642,10 @@ export function evaluateWeights(input: EvaluateInput): {
       input.costs,
       input.fxReturns,
       input.foreign,
+      input.hedgeReturns,
+      input.hedgeMode,
+      input.cpiReturns,
+      input.evaluationBasis,
     ),
     worstStart,
     bestStart,

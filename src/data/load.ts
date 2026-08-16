@@ -1,14 +1,8 @@
-import type { Asset, Currency, Point } from '../types'
+import type { Asset, Currency, Point, SeriesFile } from '../types'
 import { exposureOf } from './exposure.ts'
 import raw from './series.json' with { type: 'json' }
 
-type Raw = {
-  meta: { fetchedAt: string; notes: string[] }
-  fx: { USDJPY: Point[] }
-  assets: Asset[]
-}
-
-export const series = raw as unknown as Raw
+export const series = raw as unknown as SeriesFile
 
 function toMap(points: Point[]): Map<string, number> {
   const m = new Map<string, number>()
@@ -48,8 +42,14 @@ function returnsFromLevels(levels: number[]): number[] {
   return row
 }
 
-export function alignSelected(assets: Asset[], base: Currency) {
+export function alignSelected(
+  assets: Asset[],
+  base: Currency,
+  options: { requireCpi?: boolean; requireHedge?: boolean } = {},
+) {
   const fx = toMap(series.fx.USDJPY)
+  const cpi = series.inflation ? toMap(series.inflation.JPY) : new Map<string, number>()
+  const hedge = series.fx.hedgeReturnJPY ? toMap(series.fx.hedgeReturnJPY) : new Map<string, number>()
   const maps = assets.map((a) => toMap(a.points))
   const exposures = assets.map((a) => exposureOf(a.id, a.currency))
   const needFx =
@@ -59,7 +59,13 @@ export function alignSelected(assets: Asset[], base: Currency) {
   if (needFx) for (const d of fx.keys()) allDates.add(d)
 
   const common = [...allDates]
-    .filter((d) => maps.every((m) => m.has(d)) && (!needFx || fx.has(d)))
+    .filter(
+      (d) =>
+        maps.every((m) => m.has(d)) &&
+        (!needFx || fx.has(d)) &&
+        (!options.requireCpi || cpi.has(d)) &&
+        (!options.requireHedge || !needFx || hedge.has(d)),
+    )
     .sort()
 
   const dates = longestRun(common)
@@ -69,6 +75,10 @@ export function alignSelected(assets: Asset[], base: Currency) {
       returns: [] as number[][],
       localReturns: [] as number[][],
       fxReturns: [] as number[],
+      hedgeReturns: [] as number[],
+      cpiLevels: [] as number[],
+      cpiReturns: [] as number[],
+      cpiReference: null as number | null,
       foreign: [] as boolean[],
       start: null as string | null,
       end: null as string | null,
@@ -99,6 +109,18 @@ export function alignSelected(assets: Asset[], base: Currency) {
     if (!a || !b) return 0
     return base === 'JPY' ? b / a - 1 : a / b - 1
   })
+  const hedgeReturns = retDates.map((date) => {
+    const value = hedge.get(date)
+    if (value == null) return 0
+    return base === 'JPY' ? value : 1 / (1 + value) - 1
+  })
+  const alignedCpiLevels = dates.map((date) => cpi.get(date) ?? 0)
+  const cpiReturns = retDates.map((_, i) => {
+    const a = alignedCpiLevels[i]
+    const b = alignedCpiLevels[i + 1]
+    return a > 0 && b > 0 ? b / a - 1 : 0
+  })
+  const cpiReference = series.inflation?.JPY.at(-1)?.[1] ?? null
   const foreign = exposures.map((e) => e !== base)
 
   return {
@@ -106,6 +128,10 @@ export function alignSelected(assets: Asset[], base: Currency) {
     returns,
     localReturns,
     fxReturns,
+    hedgeReturns,
+    cpiLevels: alignedCpiLevels,
+    cpiReturns,
+    cpiReference,
     foreign,
     start: retDates[0] ?? null,
     end: retDates[retDates.length - 1] ?? null,

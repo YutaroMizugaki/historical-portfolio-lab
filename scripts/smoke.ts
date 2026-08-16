@@ -167,6 +167,70 @@ assert(mixFx.median !== mixNoFx.median, 'FX should move median')
 assert(Math.abs(mixFx.median - noFee.median) / noFee.median < 0.002, `explicit FX vs pre-converted ${mixFx.median} vs ${noFee.median}`)
 assert(mixFx.windows.some((w) => w.fxImpact !== 0), 'window fx impact')
 
+assert((series.inflation?.JPY.length ?? 0) > 600, 'Japan CPI bundled')
+assert((series.fx.hedgeReturnJPY?.length ?? 0) > 500, 'hedge return bundled')
+assert(mix.hedgeReturns.length === mix.dates.length, 'hedge returns aligned')
+
+const syntheticDates = Array.from({ length: 12 }, (_, i) => `2020-${String(i + 1).padStart(2, '0')}`)
+const syntheticReturns = [new Array(12).fill(0)]
+const flatCpi = new Array(13).fill(100)
+const risingCpi = Array.from({ length: 13 }, (_, i) => 100 + i)
+const syntheticBase = {
+  returns: syntheticReturns,
+  dates: syntheticDates,
+  weights: [1],
+  periodMonths: 12,
+  rollStep: 12,
+  rebalEvery: 0,
+  initial: 0,
+  monthly: 100,
+  target: 0,
+  rfAnnual: 0,
+  costs: zeroCost,
+  liquidate: true,
+  withWindows: true,
+  computeRequired: false,
+}
+const nominalSynthetic = evaluateWeights(syntheticBase)
+const flatReal = evaluateWeights({
+  ...syntheticBase,
+  evaluationBasis: 'real',
+  cpiLevels: flatCpi,
+  cpiReturns: new Array(12).fill(0),
+  cpiReference: 100,
+})
+const inflationReal = evaluateWeights({
+  ...syntheticBase,
+  evaluationBasis: 'real',
+  cpiLevels: risingCpi,
+  cpiReturns: risingCpi.slice(1).map((v, i) => v / risingCpi[i]! - 1),
+  cpiReference: 112,
+})
+assert(Math.abs(nominalSynthetic.median - flatReal.median) < 1e-6, 'flat CPI nominal equals real')
+assert(inflationReal.median < nominalSynthetic.median, 'inflation lowers real cash outcome')
+
+const unhedgedSynthetic = evaluateWeights({
+  ...syntheticBase,
+  initial: 1_000,
+  monthly: 0,
+  fxReturns: new Array(12).fill(0.01),
+  foreign: [true],
+  hedgeReturns: new Array(12).fill(-0.002),
+  hedgeMode: 'unhedged',
+})
+const hedgedSynthetic = evaluateWeights({
+  ...syntheticBase,
+  initial: 1_000,
+  monthly: 0,
+  fxReturns: new Array(12).fill(0.01),
+  foreign: [true],
+  hedgeReturns: new Array(12).fill(-0.002),
+  hedgeMode: 'hedged',
+})
+assert(unhedgedSynthetic.median > 1_000, 'unhedged applies FX gain')
+assert(hedgedSynthetic.median < 1_000, 'hedged applies rate-differential cost')
+assert(hedgedSynthetic.windows[0]!.hedgeCostPaid > 0, 'hedge cost is reported')
+
 console.log('smoke ok', {
   cashRequired: w.requiredMonthly,
   windows: w.windows.length,
@@ -175,4 +239,6 @@ console.log('smoke ok', {
   mixN: mix.dates.length,
   medianNoFee: Math.round(noFee.median),
   medianWithCosts: Math.round(withFee.median),
+  realWithInflation: Math.round(inflationReal.median),
+  hedgeCost: Math.round(hedgedSynthetic.windows[0]!.hedgeCostPaid),
 })

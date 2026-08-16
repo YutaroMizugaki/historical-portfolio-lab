@@ -1,6 +1,6 @@
-import type { AssetClass, Candidate, OptimizeMode, OptimizeProgress, OptimizeRequest, OptimizeResponse } from '../types'
-import { clipBounds, countAllocations, forEachAllocation } from './allocations'
-import { evaluateWeights } from './simulate'
+import type { AssetClass, Candidate, OptimizeMode, OptimizeProgress, OptimizeRequest, OptimizeResponse } from '../types.ts'
+import { clipBounds, countAllocations, forEachAllocation } from './allocations.ts'
+import { evaluateWeights } from './simulate.ts'
 
 type ProgressFn = (p: OptimizeProgress) => void
 type Req = OptimizeRequest & { assetClasses: AssetClass[] }
@@ -67,6 +67,17 @@ function evaluateLite(req: Req, weights: number[], computeRequired: boolean): Ca
     computeRequired,
     fxReturns: req.fxReturns,
     foreign: req.foreign,
+    hedgeReturns: req.hedgeReturns,
+    hedgeMode: req.hedgeMode,
+    evaluationBasis: req.evaluationBasis,
+    cpiLevels: req.cpiLevels,
+    cpiReturns: req.cpiLevels
+      ? req.cpiLevels.slice(1).map((value, i) => {
+          const previous = req.cpiLevels?.[i] ?? 0
+          return previous > 0 && value > 0 ? value / previous - 1 : 0
+        })
+      : undefined,
+    cpiReference: req.cpiReference,
   })
 }
 
@@ -88,6 +99,17 @@ function evaluateFull(req: Req, weights: number[], monthly: number, computeRequi
     computeRequired,
     fxReturns: req.fxReturns,
     foreign: req.foreign,
+    hedgeReturns: req.hedgeReturns,
+    hedgeMode: req.hedgeMode,
+    evaluationBasis: req.evaluationBasis,
+    cpiLevels: req.cpiLevels,
+    cpiReturns: req.cpiLevels
+      ? req.cpiLevels.slice(1).map((value, i) => {
+          const previous = req.cpiLevels?.[i] ?? 0
+          return previous > 0 && value > 0 ? value / previous - 1 : 0
+        })
+      : undefined,
+    cpiReference: req.cpiReference,
   })
 }
 

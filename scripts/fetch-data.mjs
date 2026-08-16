@@ -60,11 +60,134 @@ function ffill(rows, idx) {
   })
 }
 
-function bondReturn(yPrev, yNow) {
-  const y0 = yPrev / 100
-  const y1 = yNow / 100
-  const duration = 8.8
-  return y0 / 12 - duration * (y1 - y0)
+function interpolate(points, x) {
+  const keys = [...points.keys()].sort((a, b) => a - b)
+  if (!keys.length) return null
+  if (x <= keys[0]) return points.get(keys[0])
+  if (x >= keys.at(-1)) return points.get(keys.at(-1))
+  const hi = keys.find((k) => k >= x)
+  const lo = keys[keys.indexOf(hi) - 1]
+  const a = points.get(lo)
+  const b = points.get(hi)
+  return a + ((b - a) * (x - lo)) / (hi - lo)
+}
+
+function zeroDiscountsFromParYields(parYields) {
+  const discounts = new Map()
+  let prior = 0
+  for (let half = 1; half <= 20; half += 1) {
+    const years = half / 2
+    const quoted = interpolate(parYields, years)
+    if (!Number.isFinite(quoted)) return null
+    const coupon = quoted / 100 / 2
+    const discount = (1 - coupon * prior) / (1 + coupon)
+    if (!(discount > 0 && discount <= 1.5)) return null
+    discounts.set(years, discount)
+    prior += discount
+  }
+  return discounts
+}
+
+function zeroDiscountsFromZeroYields(zeroYields) {
+  const discounts = new Map()
+  for (let half = 1; half <= 20; half += 1) {
+    const years = half / 2
+    const quoted = interpolate(zeroYields, years)
+    if (!Number.isFinite(quoted)) return null
+    discounts.set(years, Math.exp(-(quoted / 100) * years))
+  }
+  return discounts
+}
+
+function discountAt(discounts, years) {
+  if (years <= 0) return 1
+  const keys = [...discounts.keys()].sort((a, b) => a - b)
+  const first = keys[0]
+  const last = keys.at(-1)
+  if (years <= first) return discounts.get(first) ** (years / first)
+  if (years >= last) return discounts.get(last) ** (years / last)
+  const hi = keys.find((k) => k >= years)
+  const lo = keys[keys.indexOf(hi) - 1]
+  const logLo = Math.log(discounts.get(lo))
+  const logHi = Math.log(discounts.get(hi))
+  return Math.exp(logLo + ((logHi - logLo) * (years - lo)) / (hi - lo))
+}
+
+/** One-month return from buying a new 10-year par bond and repricing it one month later. */
+function parBondOneMonthReturn(discounts0, discounts1) {
+  const paymentTimes = Array.from({ length: 20 }, (_, i) => (i + 1) / 2)
+  const annuity = paymentTimes.reduce((s, t) => s + 0.5 * discountAt(discounts0, t), 0)
+  const couponRate = (1 - discountAt(discounts0, 10)) / annuity
+  const elapsed = 1 / 12
+  let price = 0
+  for (const t of paymentTimes) price += 100 * (couponRate / 2) * discountAt(discounts1, t - elapsed)
+  price += 100 * discountAt(discounts1, 10 - elapsed)
+  return price / 100 - 1
+}
+
+function monthEndCurvesFromGsw(text) {
+  const lines = text.split(/\r?\n/)
+  const headerIndex = lines.findIndex((line) => line.startsWith('Date,BETA0,'))
+  if (headerIndex < 0) throw new Error('Federal Reserve GSW header not found')
+  const header = lines[headerIndex].split(',')
+  const zeroColumns = new Map()
+  for (let year = 1; year <= 10; year += 1) {
+    const idx = header.indexOf(`SVENY${String(year).padStart(2, '0')}`)
+    if (idx < 0) throw new Error(`Federal Reserve GSW SVENY${year} missing`)
+    zeroColumns.set(year, idx)
+  }
+  const monthEnds = new Map()
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (!/^\d{4}-\d{2}-\d{2},/.test(line)) continue
+    const cols = line.split(',')
+    const curve = new Map()
+    for (const [year, idx] of zeroColumns) {
+      const value = Number(cols[idx])
+      if (Number.isFinite(value) && value > -10 && value < 100) curve.set(year, value)
+    }
+    if (curve.size === zeroColumns.size) monthEnds.set(cols[0].slice(0, 7), curve)
+  }
+  return monthEnds
+}
+
+function syntheticBondLevels(curves, curveToDiscounts) {
+  const rows = [...curves.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+  const monthly = []
+  for (let i = 1; i < rows.length; i += 1) {
+    if (monthDelta(rows[i - 1][0], rows[i][0]) !== 1) continue
+    const d0 = curveToDiscounts(rows[i - 1][1])
+    const d1 = curveToDiscounts(rows[i][1])
+    if (!d0 || !d1) continue
+    const r = parBondOneMonthReturn(d0, d1)
+    if (Number.isFinite(r) && r > -0.8 && r < 0.8) monthly.push([rows[i][0], r])
+  }
+  return returnsToLevels(monthly)
+}
+
+function parseCpi(json) {
+  const rows = json?.GET_STATS?.STATISTICAL_DATA?.DATA_INF?.DATA_OBJ ?? []
+  return rows
+    .map((row) => {
+      const value = row.VALUE ?? {}
+      const key = String(value['@time'] ?? '')
+      return [`${key.slice(0, 4)}-${key.slice(4, 6)}`, Number(value.$)]
+    })
+    .filter(([date, value]) => /^\d{4}-\d{2}$/.test(date) && Number.isFinite(value) && value > 0)
+}
+
+function validateMonthly(name, points, minLength, minStartYear) {
+  if (points.length < minLength) throw new Error(`${name}: only ${points.length} monthly points`)
+  if (Number(points[0][0].slice(0, 4)) > minStartYear) throw new Error(`${name}: starts too late at ${points[0][0]}`)
+  if (!isMonthlySeries(points)) throw new Error(`${name}: series is not monthly`)
+}
+
+{
+  const flatFivePercent = new Map(Array.from({ length: 10 }, (_, i) => [i + 1, 5]))
+  const discounts = zeroDiscountsFromZeroYields(flatFivePercent)
+  const monthly = parBondOneMonthReturn(discounts, discounts)
+  if (!(monthly > 0.002 && monthly < 0.008)) {
+    throw new Error(`bond repricing self-test failed: ${monthly}`)
+  }
 }
 
 function parseTfNikkeiMonth(raw) {
@@ -268,7 +391,11 @@ function addAsset(a) {
 
 console.log('Downloading public series…')
 
-const [spCsv, goldCsv, fxCsv, nikkeiOld, nikkeiNew, jgbText, oilCsv] = await Promise.all([
+const cpiUrl =
+  'https://dashboard.e-stat.go.jp/api/1.0/Json/getData?Lang=JP&IndicatorCode=0703010501010090000&RegionalRank=2&Cycle=1&IsSeasonalAdjustment=1&MetaGetFlg=Y'
+const gswUrl = 'https://www.federalreserve.gov/data/yield-curve-tables/feds200628.csv'
+
+const [spCsv, goldCsv, fxCsv, nikkeiOld, nikkeiNew, jgbText, oilCsv, cpiJson, gswText] = await Promise.all([
   fetchText('https://raw.githubusercontent.com/datasets/s-and-p-500/master/data/data.csv'),
   fetchText('https://raw.githubusercontent.com/datasets/gold-prices/master/data/monthly.csv'),
   fetchText('https://raw.githubusercontent.com/datasets/exchange-rates/master/data/monthly.csv'),
@@ -276,6 +403,8 @@ const [spCsv, goldCsv, fxCsv, nikkeiOld, nikkeiNew, jgbText, oilCsv] = await Pro
   fetchText('https://indexes.nikkei.co.jp/nkave/historical/nikkei_stock_average_monthly_jp.csv', 'shift_jis'),
   fetchText('https://www.mof.go.jp/jgbs/reference/interest_rate/data/jgbcm_all.csv', 'shift_jis'),
   fetchText('https://raw.githubusercontent.com/datasets/oil-prices/master/data/brent-monthly.csv'),
+  fetchText(cpiUrl).then(JSON.parse),
+  fetchText(gswUrl),
 ])
 
 const frenchDev = unzipFirstCsv(
@@ -303,25 +432,21 @@ const spData = spRows.slice(1).filter((r) => r[0] && Number(r[1]) > 0)
 const spDateIdx = 0
 const spPxIdx = spHeader.indexOf('SP500')
 const spDivIdx = spHeader.indexOf('Dividend')
-const spRateIdx = spHeader.indexOf('Long Interest Rate')
 const divs = ffill(spData, spDivIdx)
-const rates = ffill(spData, spRateIdx)
 
 const spTr = []
-const usBond = []
 for (let i = 1; i < spData.length; i += 1) {
   const date = spData[i][spDateIdx].slice(0, 7)
   const px0 = Number(spData[i - 1][spPxIdx])
   const px1 = Number(spData[i][spPxIdx])
   const div = (divs[i] ?? divs[i - 1] ?? 0) / 12
   if (px0 > 0 && px1 > 0) spTr.push([date, (px1 - px0 + div) / px0])
-  const y0 = rates[i - 1]
-  const y1 = rates[i]
-  if (y0 != null && y1 != null) usBond.push([date, bondReturn(y0, y1)])
 }
 
 const spLevels = returnsToLevels(spTr)
-const usBondLevels = returnsToLevels(usBond)
+const usCurves = monthEndCurvesFromGsw(gswText)
+const usBondLevels = syntheticBondLevels(usCurves, zeroDiscountsFromZeroYields)
+const cpiLevels = parseCpi(cpiJson)
 
 const goldLevels = parseCsv(goldCsv)
   .slice(1)
@@ -386,16 +511,16 @@ for (const line of jgbText.split(/\r?\n/)) {
   const cols = line.split(',')
   const parsed = parseMofDate(cols[0] ?? '')
   if (!parsed) continue
-  const y10 = Number(cols[10])
-  if (!Number.isFinite(y10)) continue
-  jgbMonthEnd.set(parsed.ym, y10)
+  const curve = new Map()
+  for (let year = 1; year <= 10; year += 1) {
+    const value = Number(cols[year])
+    if (Number.isFinite(value) && value > -10 && value < 100) curve.set(year, value)
+  }
+  // Early MOF rows do not contain every tenor. Keep them when 10Y exists and
+  // interpolate the missing par-curve nodes from the available maturities.
+  if (curve.has(10)) jgbMonthEnd.set(parsed.ym, curve)
 }
-const jgbYields = [...jgbMonthEnd.entries()].sort((a, b) => a[0].localeCompare(b[0]))
-const jgbTr = []
-for (let i = 1; i < jgbYields.length; i += 1) {
-  jgbTr.push([jgbYields[i][0], bondReturn(jgbYields[i - 1][1], jgbYields[i][1])])
-}
-const jgbLevels = returnsToLevels(jgbTr)
+const jgbLevels = syntheticBondLevels(jgbMonthEnd, zeroDiscountsFromParYields)
 
 const jgb1yMonthEnd = new Map()
 for (const line of jgbText.split(/\r?\n/)) {
@@ -430,6 +555,22 @@ for (let i = 1; i < jgb1yFilled.length; i += 1) {
   jpyStTr.push([jgb1yFilled[i][0], jgb1yFilled[i - 1][1] / 100 / 12])
 }
 const jpyStLevels = returnsToLevels(jpyStTr)
+
+const us1yMonthEnd = new Map(
+  [...usCurves.entries()].map(([date, curve]) => [date, curve.get(1)]).filter(([, value]) => Number.isFinite(value)),
+)
+const hedgeReturnLevels = []
+for (const [date, jpyRate] of jgb1yFilled) {
+  const usdRate = us1yMonthEnd.get(date)
+  if (!Number.isFinite(usdRate)) continue
+  const monthlyHedgeReturn = ((1 + jpyRate / 100) / (1 + usdRate / 100)) ** (1 / 12) - 1
+  hedgeReturnLevels.push([date, monthlyHedgeReturn])
+}
+
+validateMonthly('Japan CPI', cpiLevels, 600, 1970)
+validateMonthly('synthetic JGB TR', jgbLevels, 450, 1987)
+validateMonthly('synthetic US Treasury TR', usBondLevels, 650, 1972)
+validateMonthly('USDJPY hedge return', hedgeReturnLevels, 500, 1975)
 
 const developed = parseFrenchMarket(frenchDev)
 const developedExUs = parseFrenchMarket(frenchDevExUs)
@@ -547,7 +688,8 @@ addAsset({
   region: 'japan',
   currency: 'JPY',
   returnType: 'total',
-  source: '財務省 国債金利情報 10年。Duration 8.8 の定数満期近似トータルリターン。',
+  source:
+    '財務省 国債金利情報の1〜10年パーカーブから、10年パー債を毎月ロールする合成トータルリターン。実指数ではない。',
   points: jgbLevels,
 })
 
@@ -571,7 +713,8 @@ addAsset({
   region: 'us',
   currency: 'USD',
   returnType: 'total',
-  source: 'Shiller long interest rate から 10年定数満期債券TRを近似。',
+  source:
+    'Federal Reserve Gürkaynak–Sack–Wright ゼロカーブから、10年パー債を毎月ロールする合成トータルリターン。実指数ではない。',
   points: usBondLevels,
 })
 
@@ -696,12 +839,25 @@ const payload = {
   meta: {
     fetchedAt: new Date().toISOString().slice(0, 10),
     notes: [
-      '外国資産は基準通貨へ Unhedged 換算する。',
-      '売買コスト 0%、税引前、名目リターン。',
+      '外国資産は基準通貨へ Unhedged 換算する。ヘッジ時は日米1年金利差によるCIP推定値を使う。',
+      '日本CPIは統計ダッシュボード/e-Statの全国総合（2020年基準）。加工済み。',
+      '日米国債は公的イールドカーブから再構築した10年定数満期パー債TRで、実指数ではない。',
+      '収録系列は売買コスト0%、税引前、名目リターン。実質評価はシミュレーション時にCPI調整する。',
       '指数によって Price Return / Total Return が異なる。画面の表示を確認すること。',
     ],
   },
-  fx: { USDJPY: fxLevels },
+  fx: {
+    USDJPY: fxLevels,
+    hedgeReturnJPY: hedgeReturnLevels,
+    hedgeSource:
+      '財務省JGB 1年金利とFederal Reserve GSW米国1年ゼロ金利の差から算出したCIP推定月次ヘッジ収益。通貨ベーシス・売買スプレッドは含まない。',
+  },
+  inflation: {
+    JPY: cpiLevels,
+    base: '2020=100',
+    source:
+      '総務省統計局 統計ダッシュボード/e-Stat 消費者物価指数（全国・総合、2020年基準）。再配布用に月次系列へ加工。',
+  },
   assets,
 }
 
@@ -713,3 +869,7 @@ for (const a of assets) {
   console.log(`  ${a.id.padEnd(12)} ${a.points[0][0]} → ${a.points.at(-1)[0]}  n=${a.points.length}`)
 }
 console.log(`  USDJPY       ${fxLevels[0][0]} → ${fxLevels.at(-1)[0]}  n=${fxLevels.length}`)
+console.log(`  CPI JPY      ${cpiLevels[0][0]} → ${cpiLevels.at(-1)[0]}  n=${cpiLevels.length}`)
+console.log(
+  `  Hedge return ${hedgeReturnLevels[0][0]} → ${hedgeReturnLevels.at(-1)[0]}  n=${hedgeReturnLevels.length}`,
+)

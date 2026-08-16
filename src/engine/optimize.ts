@@ -1,11 +1,14 @@
-import type { AssetClass, Candidate, OptimizeRequest, OptimizeResponse, OptimizeProgress } from '../types'
+import type { AssetClass, Candidate, OptimizeMode, OptimizeProgress, OptimizeRequest, OptimizeResponse } from '../types'
 import { clipBounds, countAllocations, forEachAllocation } from './allocations'
 import { evaluateWeights } from './simulate'
 
 type ProgressFn = (p: OptimizeProgress) => void
 type Req = OptimizeRequest & { assetClasses: AssetClass[] }
+type ScoreMode = 'minimax' | 'median' | 'sharpe'
 
-function score(mode: OptimizeRequest['mode'], c: Candidate): number {
+const EXPLORE_MODES: ScoreMode[] = ['minimax', 'median', 'sharpe']
+
+function score(mode: OptimizeMode, c: Candidate): number {
   if (mode === 'minimax') return c.worst
   if (mode === 'minContribution') return -c.requiredMonthly
   if (mode === 'successRate') return c.successRate * 1e12 + c.worst
@@ -41,7 +44,12 @@ function pickStep(
   return { step: chosen, count }
 }
 
-function evaluateLite(req: Req, weights: number[]): Candidate {
+function percentOf(tested: number, total: number): number {
+  if (total <= 0) return 0
+  return Math.min(99, Math.max(0, Math.round((100 * tested) / total)))
+}
+
+function evaluateLite(req: Req, weights: number[], computeRequired: boolean): Candidate {
   return evaluateWeights({
     returns: req.returns,
     dates: req.dates,
@@ -56,7 +64,7 @@ function evaluateLite(req: Req, weights: number[]): Candidate {
     costs: req.costs,
     liquidate: req.liquidate,
     withWindows: false,
-    computeRequired: req.mode === 'minContribution',
+    computeRequired,
     fxReturns: req.fxReturns,
     foreign: req.foreign,
   })
@@ -83,6 +91,60 @@ function evaluateFull(req: Req, weights: number[], monthly: number, computeRequi
   })
 }
 
+function insertTop(top: Candidate[], cand: Candidate, mode: OptimizeMode, keep: number): void {
+  if (top.length < keep) {
+    top.push(cand)
+    top.sort((a, b) => score(mode, b) - score(mode, a))
+    return
+  }
+  if (score(mode, cand) > score(mode, top[keep - 1]!)) {
+    top[keep - 1] = cand
+    top.sort((a, b) => score(mode, b) - score(mode, a))
+  }
+}
+
+function emptyBoards(modes: OptimizeMode[]): Map<OptimizeMode, Candidate[]> {
+  return new Map(modes.map((m) => [m, [] as Candidate[]]))
+}
+
+function weightKey(weights: number[]): string {
+  return weights.map((w) => Math.round(w * 10_000)).join(',')
+}
+
+function uniqueSeeds(groups: Candidate[][]): Candidate[] {
+  const seen = new Set<string>()
+  const out: Candidate[] = []
+  for (const group of groups) {
+    for (const cand of group) {
+      const key = weightKey(cand.weights)
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(cand)
+    }
+  }
+  return out
+}
+
+function planFineRegion(
+  n: number,
+  seed: Candidate,
+  reqMins: number[],
+  reqMaxs: number[],
+): { minPct: number[]; maxPct: number[]; step: number; count: number } {
+  const center = seed.weights.map((w) => Math.round(w * 100))
+  const minPct = center.map((c, i) => (c === 0 ? 0 : Math.max(reqMins[i]!, c - 10)))
+  const maxPct = center.map((c, i) => (c === 0 ? 0 : Math.min(reqMaxs[i]!, c + 10)))
+  const b1 = clipBounds(n, 100, minPct, maxPct, 1)
+  let step = 1
+  let count = countAllocations(n, 100, b1.mins, b1.maxs)
+  if (count > 20_000) {
+    step = 2
+    const b2 = clipBounds(n, 50, minPct, maxPct, 2)
+    count = countAllocations(n, 50, b2.mins, b2.maxs)
+  }
+  return { minPct, maxPct, step, count }
+}
+
 function searchGrid(
   req: Req,
   step: number,
@@ -90,36 +152,56 @@ function searchGrid(
   maxPct: number[],
   phase: 'coarse' | 'fine',
   keep: number,
+  modes: OptimizeMode[],
+  computeRequired: boolean,
   onProgress: ProgressFn,
   testedOffset: number,
   total: number,
-): Candidate[] {
+): Map<OptimizeMode, Candidate[]> {
   const n = req.assetIds.length
   const units = Math.round(100 / step)
   const { mins, maxs } = clipBounds(n, units, minPct, maxPct, step)
-  const top: Candidate[] = []
+  const boards = emptyBoards(modes)
   let tested = 0
+  let lastPost = 0
   forEachAllocation(n, units, mins, maxs, (u) => {
-    const cand = evaluateLite(req, toWeights(u, step))
+    const cand = evaluateLite(req, toWeights(u, step), computeRequired)
     tested += 1
-    if (top.length < keep) {
-      top.push(cand)
-      top.sort((a, b) => score(req.mode, b) - score(req.mode, a))
-    } else if (score(req.mode, cand) > score(req.mode, top[keep - 1]!)) {
-      top[keep - 1] = cand
-      top.sort((a, b) => score(req.mode, b) - score(req.mode, a))
-    }
-    if (tested % 50 === 0) {
-      onProgress({
-        phase,
-        tested: testedOffset + tested,
-        total,
-        best: top[0] ?? null,
-      })
+    for (const mode of modes) insertTop(boards.get(mode)!, cand, mode, keep)
+    if (tested % 25 === 0) {
+      const now = Date.now()
+      if (now - lastPost >= 80) {
+        lastPost = now
+        const preview = boards.get(modes[0]!)?.[0] ?? null
+        onProgress({
+          phase,
+          tested: testedOffset + tested,
+          total,
+          percent: percentOf(testedOffset + tested, total),
+          best: preview,
+          byMode: snapshotByMode(boards),
+        })
+      }
     }
   })
-  onProgress({ phase, tested: testedOffset + tested, total, best: top[0] ?? null })
-  return top
+  onProgress({
+    phase,
+    tested: testedOffset + tested,
+    total,
+    percent: percentOf(testedOffset + tested, total),
+    best: boards.get(modes[0]!)?.[0] ?? null,
+    byMode: snapshotByMode(boards),
+  })
+  return boards
+}
+
+function snapshotByMode(boards: Map<OptimizeMode, Candidate[]>): OptimizeProgress['byMode'] {
+  const out: NonNullable<OptimizeProgress['byMode']> = {}
+  for (const mode of EXPLORE_MODES) {
+    const top = boards.get(mode)?.[0]
+    if (top) out[mode] = top
+  }
+  return Object.keys(out).length ? out : undefined
 }
 
 function comparisonWeights(req: Req): { label: string; weights: number[] }[] {
@@ -145,58 +227,161 @@ function comparisonWeights(req: Req): { label: string; weights: number[] }[] {
   return rows
 }
 
+function leadersSnapshot(bestLite: Map<OptimizeMode, Candidate>): OptimizeProgress['byMode'] {
+  const out: NonNullable<OptimizeProgress['byMode']> = {}
+  for (const mode of EXPLORE_MODES) {
+    const top = bestLite.get(mode)
+    if (top) out[mode] = top
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+function mergeBoards(target: Map<OptimizeMode, Candidate[]>, incoming: Map<OptimizeMode, Candidate[]>, keep: number): void {
+  for (const [mode, list] of incoming) {
+    const dest = target.get(mode)
+    if (!dest) continue
+    for (const cand of list) insertTop(dest, cand, mode, keep)
+  }
+}
+
 export function runOptimize(req: Req, onProgress: ProgressFn = () => {}): OptimizeResponse {
   const n = req.assetIds.length
   if (n === 0) throw new Error('no assets')
   const reverse = req.mode === 'minContribution' || req.mode === 'successRate'
+  const scoreAll = req.scoreAll && !reverse
+  const modes: OptimizeMode[] = scoreAll ? [...EXPLORE_MODES] : [req.mode]
   const { step, count } = pickStep(n, req.stepPct, req.mins, req.maxs, reverse)
   let note: string | null = null
   if (step !== req.stepPct) {
     note = `組み合わせが多いため粗探索を ${step}% 刻みに変更しました（${count.toLocaleString()} 通り）。`
   }
 
-  const coarse = searchGrid(req, step, req.mins, req.maxs, 'coarse', 5, onProgress, 0, count)
-  let bestLite = coarse[0]
-  if (!bestLite) throw new Error('no feasible allocation')
+  const computeRequired = req.mode === 'minContribution'
+  const estimatedFine = req.fineSearch ? Math.max(200, Math.round(count * 0.2)) : 0
+  let grandTotal = count + estimatedFine
+  onProgress({
+    phase: 'coarse',
+    tested: 0,
+    total: grandTotal,
+    percent: 0,
+    best: null,
+  })
+
+  const coarse = searchGrid(
+    req,
+    step,
+    req.mins,
+    req.maxs,
+    'coarse',
+    5,
+    modes,
+    computeRequired,
+    onProgress,
+    0,
+    grandTotal,
+  )
+
+  const bestLite = new Map<OptimizeMode, Candidate>()
+  for (const mode of modes) {
+    const top = coarse.get(mode)?.[0]
+    if (!top) throw new Error('no feasible allocation')
+    bestLite.set(mode, top)
+  }
 
   let searched = count
   if (req.fineSearch) {
+    const seedGroups = scoreAll
+      ? EXPLORE_MODES.map((m) => (coarse.get(m) ?? []).slice(0, 2))
+      : [(coarse.get(req.mode) ?? []).slice(0, 3)]
+    const seeds = uniqueSeeds(seedGroups).slice(0, 4)
+    const regions = seeds.map((seed) => planFineRegion(n, seed, req.mins, req.maxs))
+    const fineTotal = regions.reduce((s, r) => s + r.count, 0)
+    grandTotal = count + fineTotal
+    onProgress({
+      phase: 'fine',
+      tested: count,
+      total: grandTotal,
+      percent: percentOf(count, grandTotal),
+      best: bestLite.get(modes[0]!) ?? null,
+      byMode: leadersSnapshot(bestLite),
+    })
+
+    const reportFine: ProgressFn = (p) => {
+      onProgress({
+        ...p,
+        best: bestLite.get(modes[0]!) ?? p.best,
+        byMode: leadersSnapshot(bestLite) ?? p.byMode,
+      })
+    }
+
     let offset = count
-    for (const seed of coarse.slice(0, 3)) {
-      const center = seed.weights.map((w) => Math.round(w * 100))
-      const minPct = center.map((c, i) => (c === 0 ? 0 : Math.max(req.mins[i]!, c - 10)))
-      const maxPct = center.map((c, i) => (c === 0 ? 0 : Math.min(req.maxs[i]!, c + 10)))
-      const b1 = clipBounds(n, 100, minPct, maxPct, 1)
-      let fineStep = 1
-      let fineCount = countAllocations(n, 100, b1.mins, b1.maxs)
-      if (fineCount > 20_000) {
-        fineStep = 2
-        const b2 = clipBounds(n, 50, minPct, maxPct, 2)
-        fineCount = countAllocations(n, 50, b2.mins, b2.maxs)
+    for (const region of regions) {
+      const fine = searchGrid(
+        req,
+        region.step,
+        region.minPct,
+        region.maxPct,
+        'fine',
+        3,
+        modes,
+        computeRequired,
+        reportFine,
+        offset,
+        grandTotal,
+      )
+      offset += region.count
+      searched += region.count
+      mergeBoards(coarse, fine, 5)
+      for (const mode of modes) {
+        const next = coarse.get(mode)?.[0]
+        if (next && (!bestLite.get(mode) || score(mode, next) >= score(mode, bestLite.get(mode)!))) {
+          bestLite.set(mode, next)
+        }
       }
-      const fine = searchGrid(req, fineStep, minPct, maxPct, 'fine', 3, onProgress, offset, offset + fineCount)
-      offset += fineCount
-      searched += fineCount
-      if (fine[0] && score(req.mode, fine[0]) >= score(req.mode, bestLite)) bestLite = fine[0]
     }
   }
 
-  const computeRequired = req.mode === 'minContribution'
-  const displayMonthly = computeRequired ? bestLite.requiredMonthly : req.monthly
-  const best = evaluateFull(req, bestLite.weights, displayMonthly, computeRequired)
+  const displayMonthly = computeRequired ? bestLite.get(req.mode)!.requiredMonthly : req.monthly
+  const fullCache = new Map<string, Candidate>()
+  const fullOf = (weights: number[], monthly: number): Candidate => {
+    const key = `${weightKey(weights)}:${monthly}`
+    const hit = fullCache.get(key)
+    if (hit) return hit
+    const full = evaluateFull(req, weights, monthly, computeRequired)
+    fullCache.set(key, full)
+    return full
+  }
 
-  const comparisons = [
-    { label: '最適配分', candidate: best },
-    ...comparisonWeights(req).map(({ label, weights }) => ({
-      label,
-      candidate: evaluateFull(
-        req,
-        weights,
-        computeRequired ? evaluateLite(req, weights).requiredMonthly : req.monthly,
-        computeRequired,
-      ),
-    })),
-  ]
+  const best = fullOf(bestLite.get(modes[0]!)!.weights, displayMonthly)
+  let byMode: OptimizeResponse['byMode']
+  if (scoreAll) {
+    byMode = {
+      minimax: fullOf(bestLite.get('minimax')!.weights, req.monthly),
+      median: fullOf(bestLite.get('median')!.weights, req.monthly),
+      sharpe: fullOf(bestLite.get('sharpe')!.weights, req.monthly),
+    }
+  }
 
-  return { best, comparisons, searched, stepUsed: step, note }
+  const comparisons = scoreAll && byMode
+    ? [
+        { label: 'Worst Case', candidate: byMode.minimax },
+        { label: '中央値', candidate: byMode.median },
+        { label: 'Sharpe', candidate: byMode.sharpe },
+        ...comparisonWeights(req).map(({ label, weights }) => ({
+          label,
+          candidate: fullOf(weights, req.monthly),
+        })),
+      ]
+    : [
+        { label: '最適配分', candidate: best },
+        ...comparisonWeights(req).map(({ label, weights }) => ({
+          label,
+          candidate: fullOf(
+            weights,
+            computeRequired ? evaluateLite(req, weights, true).requiredMonthly : req.monthly,
+          ),
+        })),
+      ]
+
+  return { best, byMode, comparisons, searched, stepUsed: step, note }
 }

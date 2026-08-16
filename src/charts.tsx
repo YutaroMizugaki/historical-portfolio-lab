@@ -243,10 +243,12 @@ export function CompareTable({
   rows,
   currency,
   reverse,
+  highlight,
 }: {
   rows: { label: string; candidate: Candidate }[]
   currency: Currency
   reverse: boolean
+  highlight?: string
 }) {
   return (
     <div className="overflow-x-auto">
@@ -265,8 +267,11 @@ export function CompareTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, idx) => (
-            <tr key={row.label} className={`border-b border-stone-100 ${idx === 0 ? 'bg-white/70' : ''}`}>
+          {rows.map((row) => (
+            <tr
+              key={row.label}
+              className={`border-b border-stone-100 ${row.label === highlight ? 'bg-white/70' : ''}`}
+            >
               <td className="py-3 pr-3 font-medium">{row.label}</td>
               {reverse && (
                 <td className="py-3 pr-3 text-right">

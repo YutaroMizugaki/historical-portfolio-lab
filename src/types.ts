@@ -3,6 +3,7 @@ export type Region = 'japan' | 'us' | 'developed' | 'world'
 export type Currency = 'JPY' | 'USD'
 export type ReturnType = 'price' | 'total'
 export type OptimizeMode = 'minimax' | 'minContribution' | 'successRate' | 'median' | 'sharpe'
+export type ScoreMode = 'minimax' | 'median' | 'sharpe'
 export type Rebalance = 'none' | 'monthly' | 'quarterly' | 'semiannual' | 'annual'
 export type Workspace = 'explore' | 'reverse'
 export type TaxAccount = 'tokutei' | 'nisa' | 'custom'
@@ -72,6 +73,7 @@ export type OptimizeRequest = {
   monthly: number
   target: number
   mode: OptimizeMode
+  scoreAll?: boolean
   stepPct: number
   fineSearch: boolean
   mins: number[]
@@ -87,11 +89,14 @@ export type OptimizeProgress = {
   phase: 'coarse' | 'fine'
   tested: number
   total: number
+  percent: number
   best: Candidate | null
+  byMode?: Partial<Record<ScoreMode, Candidate>>
 }
 
 export type OptimizeResponse = {
   best: Candidate
+  byMode?: Record<ScoreMode, Candidate>
   comparisons: { label: string; candidate: Candidate }[]
   searched: number
   stepUsed: number

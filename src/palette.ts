@@ -1,3 +1,17 @@
+/** Colors for the long-horizon core six, keyed by asset id. */
+export const CORE_COLORS: Record<string, string> = {
+  developed: '#2f6f5e',
+  em: '#3d8ea8',
+  jgb: '#6b7c8a',
+  ust: '#3f5c8a',
+  jpy_st: '#a8a29e',
+  gold: '#c9a227',
+}
+
+export function allocColor(id: string, index: number): string {
+  return CORE_COLORS[id] ?? ALLOC_COLORS[index % ALLOC_COLORS.length]!
+}
+
 export const ALLOC_COLORS = [
   '#3f6b58',
   '#c4a35a',

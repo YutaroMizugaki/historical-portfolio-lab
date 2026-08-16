@@ -8,7 +8,7 @@ import { countAllocations, clipBounds } from './engine/allocations'
 import { analyzeFx } from './engine/fx'
 import { rebalanceEveryMonths, simulatePath } from './engine/simulate'
 import { amountPrimary, pct, signedAmount, yearLabel, ymLabel } from './format'
-import { ALLOC_COLORS } from './palette'
+import { allocColor, CORE_COLORS } from './palette'
 import type {
   Asset,
   AssetClass,
@@ -19,22 +19,28 @@ import type {
   OptimizeProgress,
   OptimizeResponse,
   Rebalance,
+  ScoreMode,
   TaxAccount,
   Workspace,
 } from './types'
 
 const PERIODS = [5, 10, 15, 20, 30] as const
-const EXPLORE_MODES: { id: OptimizeMode; label: string; hint: string }[] = [
+const EXPLORE_MODES: { id: ScoreMode; label: string; hint: string }[] = [
   { id: 'minimax', label: 'Worst Case', hint: '最悪期間の税引後手取りを最大化' },
   { id: 'median', label: '中央値', hint: '税引後手取りの中央値を最大化' },
   { id: 'sharpe', label: 'Sharpe', hint: '信託報酬・リバランス税込みの月次リターンで計算' },
 ]
+const SCORE_LABEL: Record<ScoreMode, string> = {
+  minimax: 'Worst Case',
+  median: '中央値',
+  sharpe: 'Sharpe',
+}
 const REVERSE_MODES: { id: OptimizeMode; label: string; hint: string }[] = [
   { id: 'minContribution', label: '必要積立を最小化', hint: 'どの開始年でも目標の税引後手取りに届く月額' },
   { id: 'successRate', label: '到達率を最大化', hint: '投資条件の積立額で、目標に届いた期間の割合' },
 ]
 
-const DEFAULT_IDS = ['sp500', 'devbond']
+const DEFAULT_IDS = ['developed', 'em', 'jgb', 'ust', 'jpy_st', 'gold']
 const CLASS_ORDER: AssetClass[] = ['equity', 'bond', 'reit', 'commodity', 'cash']
 const CLASS_LABEL: Record<AssetClass, string> = {
   equity: '株式',
@@ -66,7 +72,7 @@ export default function App() {
   const [customYears, setCustomYears] = useState('')
   const [currency, setCurrency] = useState<Currency>('JPY')
   const [rebalance, setRebalance] = useState<Rebalance>('annual')
-  const [exploreMode, setExploreMode] = useState<OptimizeMode>('minimax')
+  const [exploreMode, setExploreMode] = useState<ScoreMode>('minimax')
   const [reverseMode, setReverseMode] = useState<OptimizeMode>('minContribution')
   const [stepPct, setStepPct] = useState(5)
   const [fineSearch, setFineSearch] = useState(true)
@@ -139,14 +145,17 @@ export default function App() {
     workerRef.current = worker
     setBusy(true)
     setError(null)
-    setProgress({ phase: 'coarse', tested: 0, total: comboCount, best: null })
+    setProgress({ phase: 'coarse', tested: 0, total: comboCount, percent: 0, best: null })
     setResult(null)
     setPicked(null)
     worker.onmessage = (
       event: MessageEvent<{ type: string } & OptimizeProgress & { result?: OptimizeResponse; message?: string }>,
     ) => {
       if (event.data.type === 'progress') {
-        setProgress(event.data)
+        setProgress((prev) => ({
+          ...event.data,
+          percent: Math.max(prev?.percent ?? 0, event.data.percent),
+        }))
         return
       }
       if (event.data.type === 'error') {
@@ -156,8 +165,10 @@ export default function App() {
         return
       }
       if (event.data.type === 'done' && event.data.result) {
-        setResult(event.data.result)
-        const worstI = event.data.result.best.windows.findIndex((w) => w.start === event.data.result!.best.worstStart)
+        const next = event.data.result
+        setResult(next)
+        const cand = next.byMode?.[exploreMode] ?? next.best
+        const worstI = cand.windows.findIndex((w) => w.start === cand.worstStart)
         setPicked(worstI >= 0 ? worstI : 0)
         setBusy(false)
         worker.terminate()
@@ -179,6 +190,7 @@ export default function App() {
       monthly,
       target: reverse ? target : 0,
       mode,
+      scoreAll: !reverse,
       stepPct,
       fineSearch,
       mins: chosen.map((a) => bounds[a.id]?.min ?? 0),
@@ -191,7 +203,7 @@ export default function App() {
     })
   }
 
-  const best = result?.best ?? null
+  const best = (!reverse && result?.byMode ? result.byMode[exploreMode] : result?.best) ?? null
   const displayMonthly = mode === 'minContribution' && best ? best.requiredMonthly : monthly
   const path = useMemo(() => {
     if (!best || picked == null || !best.windows[picked]) return null
@@ -322,17 +334,33 @@ export default function App() {
                     <div className="flex flex-wrap gap-2">
                       {group.map((a) => {
                         const on = selected.includes(a.id)
+                        const tint = CORE_COLORS[a.id]
                         return (
                           <button
                             key={a.id}
                             type="button"
                             onClick={() => toggle(a.id)}
                             className={`rounded-full border px-3 py-1 text-xs ${
-                              on
-                                ? 'border-emerald-800 bg-emerald-900 text-amber-50'
-                                : 'border-stone-300 bg-white text-stone-700 hover:border-stone-400'
+                              tint
+                                ? ''
+                                : on
+                                  ? 'border-emerald-800 bg-emerald-900 text-amber-50'
+                                  : 'border-stone-300 bg-white text-stone-700 hover:border-stone-400'
                             }`}
+                            style={
+                              tint
+                                ? on
+                                  ? { background: tint, borderColor: tint, color: '#faf6ee' }
+                                  : { background: `${tint}22`, borderColor: tint, color: tint }
+                                : undefined
+                            }
                           >
+                            {tint && (
+                              <span
+                                className="mr-1.5 inline-block h-2 w-2 rounded-full align-middle"
+                                style={{ background: on ? '#faf6ee' : tint }}
+                              />
+                            )}
                             {a.name}
                             <span className="ml-1 opacity-70">{exposureOf(a.id, a.currency) === 'USD' ? 'ドル' : '円'}</span>
                           </button>
@@ -506,26 +534,6 @@ export default function App() {
             </Card>
           )}
 
-          {workspace === 'explore' && (
-            <Card title="最適化">
-              <div className="grid gap-2">
-                {EXPLORE_MODES.map((m) => (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onClick={() => setExploreMode(m.id)}
-                    className={`rounded-md border px-3 py-2 text-left ${
-                      exploreMode === m.id ? 'border-emerald-800 bg-emerald-950/5' : 'border-stone-200 bg-white'
-                    }`}
-                  >
-                    <div className="text-sm font-medium">{m.label}</div>
-                    <div className="text-xs text-stone-500">{m.hint}</div>
-                  </button>
-                ))}
-              </div>
-            </Card>
-          )}
-
           <details className="rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-4">
             <summary className="cursor-pointer text-sm font-medium">Advanced Settings</summary>
             <div className="mt-3 grid gap-3">
@@ -583,12 +591,12 @@ export default function App() {
             className="w-full rounded-md bg-emerald-950 py-3 text-sm font-medium text-amber-50 disabled:opacity-40"
           >
             {busy
-              ? `計算中 ${progress ? `${progress.tested.toLocaleString()} / ${Math.max(progress.total, 1).toLocaleString()}` : ''}`
+              ? `計算中 ${progress ? `${progress.percent}%` : ''}`
               : reverse
                 ? reverseMode === 'minContribution'
                   ? '必要積立を逆算'
                   : '到達率を最大化'
-                : '最適配分を探索'}
+                : 'シミュレーションを実行'}
           </button>
           {error && <p className="text-sm text-red-800">{error}</p>}
         </section>
@@ -598,17 +606,43 @@ export default function App() {
             <div className="rounded-xl border border-dashed border-stone-300 bg-white/50 px-6 py-16 text-center text-stone-500">
               {reverse
                 ? '目標金額を入れて逆算すると、税・信託報酬込みで必要な月額と配分が出ます。'
-                : '資産と積立条件を選んで探索すると、税引後手取りの分布がここに出ます。'}
+                : '資産と投資条件を入れてシミュレーションすると、Worst / 中央値 / Sharpe で配分を評価できます。'}
             </div>
           )}
 
           {busy && progress && (
-            <Card title="探索">
-              <p className="text-sm text-stone-600">
-                {progress.phase === 'coarse' ? 'Stage 1 粗探索' : 'Stage 2 精密探索'} — {progress.tested.toLocaleString()} 評価
-              </p>
-              {progress.best && (
-                <Preview candidate={progress.best} names={chosen.map((a) => a.name)} currency={currency} reverse={reverse} />
+            <Card title="計算中">
+              <div className="flex items-end justify-between gap-3">
+                <p className="text-5xl font-semibold tabular-nums tracking-tight text-stone-900">{progress.percent}%</p>
+                <p className="mb-1 text-sm text-stone-500">
+                  {progress.phase === 'coarse' ? '粗探索' : '精密探索'} {progress.tested.toLocaleString()} /{' '}
+                  {Math.max(progress.total, 1).toLocaleString()}
+                </p>
+              </div>
+              <div className="mt-4 h-2.5 overflow-hidden rounded-full bg-stone-200">
+                <div
+                  className="h-full rounded-full bg-emerald-900 transition-[width] duration-150"
+                  style={{ width: `${Math.min(100, Math.max(0, progress.percent))}%` }}
+                />
+              </div>
+              {progress.byMode && !reverse ? (
+                <div className="mt-4 grid gap-2 text-sm text-stone-700">
+                  {EXPLORE_MODES.map((m) => {
+                    const cand = progress.byMode?.[m.id]
+                    if (!cand) return null
+                    return (
+                      <p key={m.id}>
+                        <span className="text-stone-500">{m.label}</span>
+                        {' ／ '}
+                        <PreviewMix candidate={cand} names={chosen.map((a) => a.name)} />
+                      </p>
+                    )
+                  })}
+                </div>
+              ) : (
+                progress.best && (
+                  <Preview candidate={progress.best} names={chosen.map((a) => a.name)} currency={currency} reverse={reverse} />
+                )
               )}
             </Card>
           )}
@@ -616,6 +650,41 @@ export default function App() {
           {result && best && (
             <>
               {result.note && <p className="text-xs text-amber-900">{result.note}</p>}
+
+              {!reverse && result.byMode && (
+                <div>
+                  <div className="grid grid-cols-3 gap-1 rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-1">
+                    {EXPLORE_MODES.map((m) => {
+                      const cand = result.byMode![m.id]
+                      if (!cand) return null
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => {
+                            setExploreMode(m.id)
+                            const worstI = cand.windows.findIndex((w) => w.start === cand.worstStart)
+                            setPicked(worstI >= 0 ? worstI : 0)
+                          }}
+                          className={`rounded-lg px-3 py-2.5 text-left ${
+                            exploreMode === m.id ? 'bg-emerald-950 text-amber-50' : 'text-stone-700 hover:bg-white/70'
+                          }`}
+                        >
+                          <div className="text-sm font-medium">{m.label}</div>
+                          <div className={`mt-0.5 text-xs tabular-nums ${exploreMode === m.id ? 'text-amber-100/80' : 'text-stone-500'}`}>
+                            {m.id === 'sharpe'
+                              ? cand.sharpe.toFixed(2)
+                              : m.id === 'minimax'
+                                ? amountPrimary(cand.worst, currency)
+                                : amountPrimary(cand.median, currency)}
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <p className="mt-2 text-xs text-stone-500">同じシミュレーションを3つの基準で評価しています。タブを切り替えても再計算しません。</p>
+                </div>
+              )}
 
               <section className="rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-5">
                 {reverse && mode === 'minContribution' ? (
@@ -637,6 +706,16 @@ export default function App() {
                         毎月 {amountPrimary(monthly, currency)} ／ 目標 {amountPrimary(target, currency)}
                       </p>
                     </div>
+                  </div>
+                ) : exploreMode === 'minimax' ? (
+                  <div>
+                    <p className="text-sm text-stone-500">最悪期間の税引後手取り</p>
+                    <Amount n={best.worst} currency={currency} size="hero" />
+                  </div>
+                ) : exploreMode === 'sharpe' ? (
+                  <div>
+                    <p className="text-sm text-stone-500">Sharpe（信託報酬・リバランス税込み）</p>
+                    <p className="text-4xl font-semibold tracking-tight text-stone-900 sm:text-5xl">{best.sharpe.toFixed(2)}</p>
                   </div>
                 ) : (
                   <div>
@@ -677,7 +756,7 @@ export default function App() {
                   items={chosen.map((a, i) => ({
                     label: a.name,
                     weight: best.weights[i] ?? 0,
-                    color: ALLOC_COLORS[i % ALLOC_COLORS.length]!,
+                    color: allocColor(a.id, i),
                   }))}
                 />
               </Card>
@@ -800,7 +879,12 @@ export default function App() {
               )}
 
               <Card title="他の配分と比べる">
-                <CompareTable rows={result.comparisons} currency={currency} reverse={reverse} />
+                <CompareTable
+                  rows={result.comparisons}
+                  currency={currency}
+                  reverse={reverse}
+                  highlight={!reverse ? SCORE_LABEL[exploreMode] : '最適配分'}
+                />
               </Card>
 
               <Card title="系列と前提">
@@ -864,6 +948,17 @@ function Metric({
   )
 }
 
+function mixLabel(candidate: Candidate, names: string[]): string {
+  return candidate.weights
+    .map((w, i) => (w >= 0.005 ? `${names[i]} ${pct(w, 0)}` : null))
+    .filter(Boolean)
+    .join(' / ')
+}
+
+function PreviewMix({ candidate, names }: { candidate: Candidate; names: string[] }) {
+  return <>{mixLabel(candidate, names)}</>
+}
+
 function Preview({
   candidate,
   names,
@@ -875,13 +970,9 @@ function Preview({
   currency: Currency
   reverse: boolean
 }) {
-  const mix = candidate.weights
-    .map((w, i) => (w >= 0.005 ? `${names[i]} ${pct(w, 0)}` : null))
-    .filter(Boolean)
-    .join(' / ')
   return (
     <p className="mt-2 text-sm text-stone-700">
-      暫定 {mix}
+      暫定 {mixLabel(candidate, names)}
       {reverse
         ? ` ／ 毎月 ${amountPrimary(candidate.requiredMonthly, currency)}`
         : ` ／ よくある ${amountPrimary(candidate.median, currency)}`}

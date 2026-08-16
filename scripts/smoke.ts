@@ -1,6 +1,7 @@
 import { series, alignSelected } from '../src/data/load.ts'
+import { clipBounds, countAllocations } from '../src/engine/allocations.ts'
+import { buildFrontierMap, meanCov, monthlyAssetReturns, pickByRiskReturn, portMoments } from '../src/engine/frontier.ts'
 import { evaluateWeights } from '../src/engine/simulate.ts'
-import { countAllocations, clipBounds } from '../src/engine/allocations.ts'
 
 function assert(cond: unknown, msg: string) {
   if (!cond) throw new Error(msg)
@@ -230,6 +231,42 @@ const hedgedSynthetic = evaluateWeights({
 assert(unhedgedSynthetic.median > 1_000, 'unhedged applies FX gain')
 assert(hedgedSynthetic.median < 1_000, 'hedged applies rate-differential cost')
 assert(hedgedSynthetic.windows[0]!.hedgeCostPaid > 0, 'hedge cost is reported')
+
+{
+  const low = new Array(24).fill(0.001)
+  const high = Array.from({ length: 24 }, (_, i) => (i % 2 === 0 ? 0.04 : -0.01))
+  const map = buildFrontierMap({
+    returns: [high, low],
+    fxReturns: new Array(24).fill(0),
+    foreign: [false, false],
+    hedgeReturns: new Array(24).fill(0),
+    hedgeMode: 'unhedged',
+    evaluationBasis: 'nominal',
+    expenseRatios: [0, 0],
+    assetIds: ['risky', 'calm'],
+    stepPct: 10,
+    mins: [0, 0],
+    maxs: [100, 100],
+  })
+  assert(map.frontier.length >= 2, `frontier ${map.frontier.length}`)
+  assert(map.assets[0]!.mu > map.assets[1]!.mu, 'risky asset has higher mean')
+  assert(map.assets[0]!.sigma > map.assets[1]!.sigma, 'risky asset has higher vol')
+  const conservative = pickByRiskReturn(map.frontier, map.minSigma, map.minMu)
+  const aggressive = pickByRiskReturn(map.frontier, map.maxSigma, map.maxMu)
+  assert(conservative && aggressive, 'picks exist')
+  assert((conservative!.weights[1] ?? 0) > (conservative!.weights[0] ?? 0), `low-risk prefers calm ${conservative!.weights}`)
+  assert((aggressive!.weights[0] ?? 0) > (aggressive!.weights[1] ?? 0), `high-return prefers risky ${aggressive!.weights}`)
+  const rows = monthlyAssetReturns({
+    returns: [high],
+    expenseRatios: [0.012],
+    evaluationBasis: 'nominal',
+  })
+  const { mean, cov } = meanCov(rows)
+  const withTer = portMoments([1], mean, cov)
+  const raw = meanCov(monthlyAssetReturns({ returns: [high], expenseRatios: [0] }))
+  const noTer = portMoments([1], raw.mean, raw.cov)
+  assert(withTer.mu < noTer.mu, `TER lowers expected return ${withTer.mu} vs ${noTer.mu}`)
+}
 
 console.log('smoke ok', {
   cashRequired: w.requiredMonthly,

@@ -5,7 +5,7 @@ export type ReturnType = 'price' | 'total'
 export type OptimizeMode = 'minimax' | 'minContribution' | 'successRate' | 'median' | 'sharpe'
 export type ScoreMode = 'minimax' | 'median' | 'sharpe'
 export type Rebalance = 'none' | 'monthly' | 'quarterly' | 'semiannual' | 'annual'
-export type Workspace = 'explore' | 'reverse'
+export type Workspace = 'explore' | 'reverse' | 'frontier'
 export type TaxAccount = 'tokutei' | 'nisa' | 'custom'
 export type EvaluationBasis = 'nominal' | 'real'
 export type HedgeMode = 'unhedged' | 'hedged'
@@ -131,6 +131,40 @@ export type PathResult = {
   feePaid: number
   fxPnl: number
   hedgeCostPaid: number
+}
+
+export type RiskReturnPoint = {
+  weights: number[]
+  mu: number
+  sigma: number
+}
+
+export type FrontierMap = {
+  assets: { mu: number; sigma: number }[]
+  frontier: RiskReturnPoint[]
+  cloud: RiskReturnPoint[]
+  minMu: number
+  maxMu: number
+  minSigma: number
+  maxSigma: number
+  searched: number
+  stepUsed: number
+  note: string | null
+}
+
+export type FrontierRequest = {
+  returns: number[][]
+  fxReturns: number[]
+  foreign: boolean[]
+  hedgeReturns: number[]
+  hedgeMode: HedgeMode
+  evaluationBasis: EvaluationBasis
+  cpiReturns?: number[]
+  expenseRatios: number[]
+  assetIds: string[]
+  stepPct: number
+  mins: number[]
+  maxs: number[]
 }
 
 export type FxReport = {

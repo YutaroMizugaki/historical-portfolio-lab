@@ -1,6 +1,6 @@
 import { Amount } from './Amount'
 import { amountPrimary, pct, signedAmount, yearLabel, ymLabel } from './format'
-import type { Candidate, Currency, WindowResult } from './types'
+import type { Candidate, Currency, RiskReturnPoint, WindowResult } from './types'
 
 const INK = '#1c1917'
 const MUTED = '#78716c'
@@ -336,4 +336,135 @@ export function OutcomeRange({
     </div>
   )
 }
+
+export function FrontierChart({
+  cloud,
+  frontier,
+  assets,
+  assetNames,
+  assetColors,
+  selected,
+  target,
+  onPick,
+}: {
+  cloud: RiskReturnPoint[]
+  frontier: RiskReturnPoint[]
+  assets: { mu: number; sigma: number }[]
+  assetNames: string[]
+  assetColors: string[]
+  selected: RiskReturnPoint | null
+  target: { mu: number; sigma: number }
+  onPick: (sigma: number, mu: number) => void
+}) {
+  const w = 640
+  const h = 280
+  const pad = { l: 52, r: 18, t: 18, b: 40 }
+  const iw = w - pad.l - pad.r
+  const ih = h - pad.t - pad.b
+  let minS = Infinity
+  let maxS = -Infinity
+  let minM = Infinity
+  let maxM = -Infinity
+  for (const p of [...cloud, ...frontier, ...assets, selected].filter(Boolean) as { mu: number; sigma: number }[]) {
+    if (p.sigma < minS) minS = p.sigma
+    if (p.sigma > maxS) maxS = p.sigma
+    if (p.mu < minM) minM = p.mu
+    if (p.mu > maxM) maxM = p.mu
+  }
+  minS = Math.min(minS, target.sigma, 0)
+  maxS = Math.max(maxS, target.sigma)
+  minM = Math.min(minM, target.mu)
+  maxM = Math.max(maxM, target.mu)
+  const sSpan = Math.max(1e-6, maxS - minS)
+  const mSpan = Math.max(1e-6, maxM - minM)
+  const xOf = (sigma: number) => pad.l + ((sigma - minS) / sSpan) * iw
+  const yOf = (mu: number) => pad.t + ih - ((mu - minM) / mSpan) * ih
+  const path = frontier.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xOf(p.sigma).toFixed(1)} ${yOf(p.mu).toFixed(1)}`).join(' ')
+  const ticks = [0, 0.25, 0.5, 0.75, 1]
+
+  return (
+    <svg
+      viewBox={`0 0 ${w} ${h}`}
+      className="w-full cursor-crosshair"
+      role="img"
+      aria-label="予想リスクと期待リターンの地図"
+      onClick={(event) => {
+        const svg = event.currentTarget
+        const box = svg.getBoundingClientRect()
+        const px = ((event.clientX - box.left) / box.width) * w
+        const py = ((event.clientY - box.top) / box.height) * h
+        const sigma = minS + ((px - pad.l) / iw) * sSpan
+        const mu = minM + ((pad.t + ih - py) / ih) * mSpan
+        onPick(Math.max(minS, Math.min(maxS, sigma)), Math.max(minM, Math.min(maxM, mu)))
+      }}
+    >
+      {ticks.map((t) => {
+        const x = pad.l + t * iw
+        const y = pad.t + ih - t * ih
+        return (
+          <g key={t}>
+            <line x1={x} x2={x} y1={pad.t} y2={pad.t + ih} stroke="#e7e1d4" strokeWidth="1" />
+            <line x1={pad.l} x2={pad.l + iw} y1={y} y2={y} stroke="#e7e1d4" strokeWidth="1" />
+          </g>
+        )
+      })}
+      {cloud.map((p, i) => (
+        <circle key={`c${i}`} cx={xOf(p.sigma)} cy={yOf(p.mu)} r="2.2" fill="#a8a29e" opacity="0.35" />
+      ))}
+      {path && <path d={path} fill="none" stroke={GOOD} strokeWidth="2.2" />}
+      {assets.map((a, i) => (
+        <g key={assetNames[i] ?? i}>
+          <circle cx={xOf(a.sigma)} cy={yOf(a.mu)} r="4.5" fill={assetColors[i] ?? INK} />
+          <text x={xOf(a.sigma) + 6} y={yOf(a.mu) - 6} fill={INK} fontSize="11">
+            {assetNames[i]}
+          </text>
+        </g>
+      ))}
+      <line
+        x1={xOf(target.sigma)}
+        x2={xOf(target.sigma)}
+        y1={pad.t}
+        y2={pad.t + ih}
+        stroke={LINE}
+        strokeWidth="1"
+        strokeDasharray="4 3"
+      />
+      <line
+        x1={pad.l}
+        x2={pad.l + iw}
+        y1={yOf(target.mu)}
+        y2={yOf(target.mu)}
+        stroke={LINE}
+        strokeWidth="1"
+        strokeDasharray="4 3"
+      />
+      {selected && (
+        <circle
+          cx={xOf(selected.sigma)}
+          cy={yOf(selected.mu)}
+          r="7"
+          fill="#faf6ee"
+          stroke={LINE}
+          strokeWidth="2.5"
+        />
+      )}
+      <text x={pad.l} y={h - 10} fill={MUTED} fontSize="12">
+        {(minS * 100).toFixed(0)}%
+      </text>
+      <text x={w / 2} y={h - 10} fill={MUTED} fontSize="12" textAnchor="middle">
+        予想リスク（年率）
+      </text>
+      <text x={w - pad.r} y={h - 10} fill={MUTED} fontSize="12" textAnchor="end">
+        {(maxS * 100).toFixed(0)}%
+      </text>
+      <text x={pad.l} y={14} fill={MUTED} fontSize="12">
+        期待リターン {(maxM * 100).toFixed(0)}%
+      </text>
+      <text x={pad.l - 6} y={pad.t + ih} fill={MUTED} fontSize="11" textAnchor="end">
+        {(minM * 100).toFixed(0)}%
+      </text>
+    </svg>
+  )
+}
+
 

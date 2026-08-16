@@ -1,12 +1,13 @@
 import { useMemo, useRef, useState, type ReactNode } from 'react'
 import { Amount } from './Amount'
-import { AllocationDonut, CompareTable, Histogram, OutcomeRange, RollingBars, WealthChart } from './charts'
+import { AllocationDonut, CompareTable, FrontierChart, Histogram, OutcomeRange, RollingBars, WealthChart } from './charts'
 import { defaultTer, TOKUTEI_TAX } from './data/costs'
 import { exposureOf } from './data/exposure'
 import { series, alignSelected } from './data/load'
 import { countAllocations, clipBounds } from './engine/allocations'
+import { pickByRiskReturn } from './engine/frontier'
 import { analyzeFx } from './engine/fx'
-import { rebalanceEveryMonths, simulatePath } from './engine/simulate'
+import { rebalanceEveryMonths, simulatePath, evaluateWeights } from './engine/simulate'
 import { amountPrimary, pct, signedAmount, yearLabel, ymLabel } from './format'
 import { allocColor, CORE_COLORS } from './palette'
 import type {
@@ -16,6 +17,7 @@ import type {
   CostModel,
   Currency,
   EvaluationBasis,
+  FrontierMap,
   HedgeMode,
   OptimizeMode,
   OptimizeProgress,
@@ -41,6 +43,28 @@ const REVERSE_MODES: { id: OptimizeMode; label: string; hint: string }[] = [
   { id: 'minContribution', label: '必要積立を最小化', hint: 'どの開始年でも目標の税引後手取りに届く月額' },
   { id: 'successRate', label: '到達率を最大化', hint: '投資条件の積立額で、目標に届いた期間の割合' },
 ]
+
+function referenceMixes(ids: string[], classes: AssetClass[]): { label: string; weights: number[] }[] {
+  const n = ids.length
+  if (n === 0) return []
+  const eqIdx = classes.map((c, i) => (c === 'equity' ? i : -1)).filter((i) => i >= 0)
+  const bdIdx = classes.map((c, i) => (c === 'bond' ? i : -1)).filter((i) => i >= 0)
+  const rows: { label: string; weights: number[] }[] = []
+  if (eqIdx.length && bdIdx.length) {
+    const w = new Array(n).fill(0)
+    for (const i of eqIdx) w[i] = 0.6 / eqIdx.length
+    for (const i of bdIdx) w[i] = 0.4 / bdIdx.length
+    rows.push({ label: '60/40', weights: w })
+  } else {
+    rows.push({ label: '均等配分', weights: new Array(n).fill(1 / n) })
+  }
+  const sp = ids.indexOf('sp500')
+  const eq = sp >= 0 ? sp : (eqIdx[0] ?? 0)
+  const w100 = new Array(n).fill(0)
+  w100[eq] = 1
+  rows.push({ label: ids[eq] === 'sp500' ? 'S&P500 100%' : '株式 100%', weights: w100 })
+  return rows
+}
 
 const DEFAULT_IDS = ['developed', 'em', 'jgb', 'ust', 'jpy_st', 'gold']
 const CLASS_ORDER: AssetClass[] = ['equity', 'bond', 'reit', 'commodity', 'cash']
@@ -92,7 +116,11 @@ export default function App() {
   const [result, setResult] = useState<OptimizeResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [picked, setPicked] = useState<number | null>(null)
+  const [frontierMap, setFrontierMap] = useState<FrontierMap | null>(null)
+  const [targetSigma, setTargetSigma] = useState(0)
+  const [targetMu, setTargetMu] = useState(0)
   const workerRef = useRef<Worker | null>(null)
+  const pickTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const assets = series.assets
   const chosen = useMemo(
@@ -139,12 +167,69 @@ export default function App() {
 
   const mode = workspace === 'explore' ? exploreMode : reverseMode
   const reverse = workspace === 'reverse'
+  const frontier = workspace === 'frontier'
 
   const toggle = (id: string) => {
     setResult(null)
     setPicked(null)
+    setFrontierMap(null)
     setSelected((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]))
   }
+
+  const applyFrontierPick = (map: FrontierMap, sigma: number, mu: number) => {
+    const point = pickByRiskReturn(map.frontier, sigma, mu)
+    if (!point || aligned.dates.length < periodMonths + 1) return
+    const evalInput = {
+      returns: aligned.localReturns,
+      dates: aligned.dates,
+      weights: point.weights,
+      periodMonths,
+      rollStep: 12,
+      rebalEvery: rebalanceEveryMonths(rebalance),
+      initial,
+      monthly,
+      target: 0,
+      rfAnnual: riskFree / 100,
+      costs,
+      liquidate: true,
+      withWindows: true,
+      computeRequired: false,
+      fxReturns: aligned.fxReturns,
+      foreign: aligned.foreign,
+      hedgeReturns: aligned.hedgeReturns,
+      hedgeMode,
+      evaluationBasis: effectiveBasis,
+      cpiLevels: effectiveBasis === 'real' ? aligned.cpiLevels : undefined,
+      cpiReturns: effectiveBasis === 'real' ? aligned.cpiReturns : undefined,
+      cpiReference: effectiveBasis === 'real' ? (aligned.cpiReference ?? undefined) : undefined,
+    }
+    const scored = evaluateWeights(evalInput)
+    setResult({
+      best: scored,
+      comparisons: [
+        { label: '選択配分', candidate: scored },
+        ...referenceMixes(
+          chosen.map((a) => a.id),
+          chosen.map((a) => a.assetClass),
+        ).map(({ label, weights }) => ({
+          label,
+          candidate: evaluateWeights({ ...evalInput, weights }),
+        })),
+      ],
+      searched: map.searched,
+      stepUsed: map.stepUsed,
+      note: map.note,
+    })
+    const worstI = scored.windows.findIndex((w) => w.start === scored.worstStart)
+    setPicked(worstI >= 0 ? worstI : 0)
+  }
+
+  const scheduleFrontierPick = (map: FrontierMap, sigma: number, mu: number) => {
+    if (pickTimer.current) clearTimeout(pickTimer.current)
+    pickTimer.current = setTimeout(() => applyFrontierPick(map, sigma, mu), 60)
+  }
+
+  const selectedPoint = frontierMap ? pickByRiskReturn(frontierMap.frontier, targetSigma, targetMu) : null
 
   const run = () => {
     if (chosen.length === 0 || aligned.dates.length < periodMonths + 1) return
@@ -153,13 +238,58 @@ export default function App() {
       return
     }
     workerRef.current?.terminate()
-    const worker = new Worker(new URL('./workers/optimize.worker.ts', import.meta.url), { type: 'module' })
-    workerRef.current = worker
     setBusy(true)
     setError(null)
-    setProgress({ phase: 'coarse', tested: 0, total: comboCount, percent: 0, best: null })
     setResult(null)
     setPicked(null)
+    if (frontier) {
+      setFrontierMap(null)
+      setProgress({ phase: 'coarse', tested: 0, total: comboCount, percent: 0, best: null })
+      const worker = new Worker(new URL('./workers/frontier.worker.ts', import.meta.url), { type: 'module' })
+      workerRef.current = worker
+      worker.onmessage = (event: MessageEvent<{ type: string; result?: FrontierMap; message?: string }>) => {
+        if (event.data.type === 'error') {
+          setError(event.data.message ?? 'フロンティアの作成に失敗しました')
+          setBusy(false)
+          worker.terminate()
+          return
+        }
+        if (event.data.type === 'done' && event.data.result) {
+          const next = event.data.result
+          const mid = next.frontier[Math.floor((next.frontier.length - 1) / 2)] ?? next.frontier[0]
+          setFrontierMap(next)
+          if (mid) {
+            setTargetSigma(mid.sigma)
+            setTargetMu(mid.mu)
+            applyFrontierPick(next, mid.sigma, mid.mu)
+          }
+          setBusy(false)
+          worker.terminate()
+        }
+      }
+      worker.onerror = () => {
+        setError('Worker でエラーが発生しました')
+        setBusy(false)
+      }
+      worker.postMessage({
+        returns: aligned.localReturns,
+        fxReturns: aligned.fxReturns,
+        foreign: aligned.foreign,
+        hedgeReturns: aligned.hedgeReturns,
+        hedgeMode,
+        evaluationBasis: effectiveBasis,
+        cpiReturns: effectiveBasis === 'real' ? aligned.cpiReturns : undefined,
+        expenseRatios: costs.expenseRatios,
+        assetIds: chosen.map((a) => a.id),
+        stepPct,
+        mins: chosen.map((a) => bounds[a.id]?.min ?? 0),
+        maxs: chosen.map((a) => bounds[a.id]?.max ?? 100),
+      })
+      return
+    }
+    const worker = new Worker(new URL('./workers/optimize.worker.ts', import.meta.url), { type: 'module' })
+    workerRef.current = worker
+    setProgress({ phase: 'coarse', tested: 0, total: comboCount, percent: 0, best: null })
     worker.onmessage = (
       event: MessageEvent<{ type: string } & OptimizeProgress & { result?: OptimizeResponse; message?: string }>,
     ) => {
@@ -320,7 +450,7 @@ export default function App() {
             <p className="text-[11px] tracking-[0.22em] text-emerald-900 uppercase">Historical Portfolio Lab</p>
             <h1 className="font-serif text-3xl tracking-tight text-stone-900">どの年から始めても届く配分を探す</h1>
             <p className="mt-2 max-w-xl text-sm leading-relaxed text-stone-600">
-              リバランス時の譲渡課税・信託報酬・売買コストに加え、ドル資産は毎月の為替を円換算に入れた Rolling Backtest です。目標金額からの積立逆算は別機能です。
+              リバランス時の譲渡課税・信託報酬・売買コストに加え、ドル資産は毎月の為替を円換算に入れた Rolling Backtest です。資産を選んだあと、予想リスクと期待リターンから配分を選ぶこともできます。
             </p>
           </div>
           <div className="flex flex-wrap gap-2 text-[11px]">
@@ -335,14 +465,15 @@ export default function App() {
 
       <main className="mx-auto grid max-w-6xl gap-6 px-5 py-6 lg:grid-cols-[360px_1fr]">
         <section className="space-y-5 lg:sticky lg:top-4 lg:self-start">
-          <div className="grid grid-cols-2 gap-1 rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-1">
+          <div className="grid grid-cols-3 gap-1 rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-1">
             <button
               type="button"
               onClick={() => {
                 setWorkspace('explore')
                 setResult(null)
+                setFrontierMap(null)
               }}
-              className={`rounded-lg px-3 py-2 text-sm ${workspace === 'explore' ? 'bg-emerald-950 text-amber-50' : 'text-stone-700'}`}
+              className={`rounded-lg px-2 py-2 text-xs sm:text-sm ${workspace === 'explore' ? 'bg-emerald-950 text-amber-50' : 'text-stone-700'}`}
             >
               配分を探す
             </button>
@@ -351,10 +482,22 @@ export default function App() {
               onClick={() => {
                 setWorkspace('reverse')
                 setResult(null)
+                setFrontierMap(null)
               }}
-              className={`rounded-lg px-3 py-2 text-sm ${workspace === 'reverse' ? 'bg-emerald-950 text-amber-50' : 'text-stone-700'}`}
+              className={`rounded-lg px-2 py-2 text-xs sm:text-sm ${workspace === 'reverse' ? 'bg-emerald-950 text-amber-50' : 'text-stone-700'}`}
             >
-              目標から積立を逆算
+              積立を逆算
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setWorkspace('frontier')
+                setResult(null)
+                setFrontierMap(null)
+              }}
+              className={`rounded-lg px-2 py-2 text-xs sm:text-sm ${workspace === 'frontier' ? 'bg-emerald-950 text-amber-50' : 'text-stone-700'}`}
+            >
+              リスクとリターン
             </button>
           </div>
 
@@ -436,6 +579,7 @@ export default function App() {
                     setCurrency(next)
                     if (next === 'USD') setEvaluationBasis('nominal')
                     setResult(null)
+                    setFrontierMap(null)
                   }}
                 >
                   <option value="JPY">JPY</option>
@@ -450,6 +594,7 @@ export default function App() {
                   onChange={(e) => {
                     setEvaluationBasis(e.target.value as EvaluationBasis)
                     setResult(null)
+                    setFrontierMap(null)
                   }}
                 >
                   <option value="nominal">名目金額</option>
@@ -463,6 +608,7 @@ export default function App() {
                   onChange={(e) => {
                     setHedgeMode(e.target.value as HedgeMode)
                     setResult(null)
+                    setFrontierMap(null)
                   }}
                 >
                   <option value="unhedged">ヘッジなし</option>
@@ -612,6 +758,72 @@ export default function App() {
             </Card>
           )}
 
+          {workspace === 'frontier' && (
+            <Card title="予想リスクと期待リターン">
+              {frontierMap ? (
+                <div className="grid gap-4">
+                  <Field label={`予想リスク（年率） ${pct(targetSigma, 1)}`}>
+                    <input
+                      className="w-full accent-emerald-900"
+                      type="range"
+                      min={frontierMap.minSigma}
+                      max={Math.max(frontierMap.maxSigma, frontierMap.minSigma + 1e-6)}
+                      step={0.0005}
+                      value={targetSigma}
+                      onChange={(e) => {
+                        const sigma = Number(e.target.value)
+                        setTargetSigma(sigma)
+                        scheduleFrontierPick(frontierMap, sigma, targetMu)
+                      }}
+                    />
+                  </Field>
+                  <Field label={`期待リターン（年率） ${pct(targetMu, 1)}`}>
+                    <input
+                      className="w-full accent-emerald-900"
+                      type="range"
+                      min={frontierMap.minMu}
+                      max={Math.max(frontierMap.maxMu, frontierMap.minMu + 1e-6)}
+                      step={0.0005}
+                      value={targetMu}
+                      onChange={(e) => {
+                        const mu = Number(e.target.value)
+                        setTargetMu(mu)
+                        scheduleFrontierPick(frontierMap, targetSigma, mu)
+                      }}
+                    />
+                  </Field>
+                  {selectedPoint && (
+                    <p className="text-xs text-stone-500">
+                      近い効率的配分はリスク {pct(selectedPoint.sigma, 1)} ／ リターン {pct(selectedPoint.mu, 1)}。
+                      {chosen
+                        .map((a, i) => ((selectedPoint.weights[i] ?? 0) >= 0.005 ? `${a.name} ${pct(selectedPoint.weights[i] ?? 0, 0)}` : null))
+                        .filter(Boolean)
+                        .join(' / ')}
+                    </p>
+                  )}
+                  <div className="grid gap-1.5 text-xs text-stone-600">
+                    {chosen.map((a, i) => (
+                      <div key={a.id} className="flex justify-between gap-2">
+                        <span className="truncate">{a.name}</span>
+                        <span className="tabular-nums text-stone-500">
+                          {pct(frontierMap.assets[i]?.mu ?? 0, 1)} / {pct(frontierMap.assets[i]?.sigma ?? 0, 1)}
+                        </span>
+                      </div>
+                    ))}
+                    <p className="text-[11px] text-stone-400">各資産の過去平均リターン / リスク（年率）</p>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-xs text-stone-500">
+                  資産を選んで実行すると、共通期間の平均リターンとリスクの地図ができます。スライダーか図で目標を指定してください。
+                </p>
+              )}
+              <p className="mt-3 text-xs text-stone-500">
+                期待値は信託報酬・為替方針込み、税引き前の月次リターンを年率換算したものです。将来の予測ではなく、選んだ共通期間の実績です。
+              </p>
+            </Card>
+          )}
+
           <details className="rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-4">
             <summary className="cursor-pointer text-sm font-medium">Advanced Settings</summary>
             <div className="mt-3 grid gap-3">
@@ -624,10 +836,12 @@ export default function App() {
                   ))}
                 </select>
               </Field>
-              <label className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={fineSearch} onChange={(e) => setFineSearch(e.target.checked)} />
-                Fine Search（上位の周辺を 1% 刻み）
-              </label>
+              {workspace !== 'frontier' && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={fineSearch} onChange={(e) => setFineSearch(e.target.checked)} />
+                  Fine Search（上位の周辺を 1% 刻み）
+                </label>
+              )}
               <Field label="Risk Free Rate（年率 %）">
                 <input className={inputClass} type="number" step={0.1} value={riskFree} onChange={(e) => setRiskFree(Number(e.target.value))} />
               </Field>
@@ -669,12 +883,16 @@ export default function App() {
             className="w-full rounded-md bg-emerald-950 py-3 text-sm font-medium text-amber-50 disabled:opacity-40"
           >
             {busy
-              ? `計算中 ${progress ? `${progress.percent}%` : ''}`
+              ? frontier
+                ? '地図を作成中'
+                : `計算中 ${progress ? `${progress.percent}%` : ''}`
               : reverse
                 ? reverseMode === 'minContribution'
                   ? '必要積立を逆算'
                   : '到達率を最大化'
-                : 'シミュレーションを実行'}
+                : frontier
+                  ? 'リスク・リターンの配分を出す'
+                  : 'シミュレーションを実行'}
           </button>
           {error && <p className="text-sm text-red-800">{error}</p>}
         </section>
@@ -684,26 +902,34 @@ export default function App() {
             <div className="rounded-xl border border-dashed border-stone-300 bg-white/50 px-6 py-16 text-center text-stone-500">
               {reverse
                 ? '目標金額を入れて逆算すると、税・信託報酬込みで必要な月額と配分が出ます。'
-                : '資産と投資条件を入れてシミュレーションすると、Worst / 中央値 / Sharpe で配分を評価できます。'}
+                : frontier
+                  ? '資産を選んで実行すると、過去の平均リターンとリスクの地図から配分を選べます。'
+                  : '資産と投資条件を入れてシミュレーションすると、Worst / 中央値 / Sharpe で配分を評価できます。'}
             </div>
           )}
 
           {busy && progress && (
             <Card title="計算中">
-              <div className="flex items-end justify-between gap-3">
-                <p className="text-5xl font-semibold tabular-nums tracking-tight text-stone-900">{progress.percent}%</p>
-                <p className="mb-1 text-sm text-stone-500">
-                  {progress.phase === 'coarse' ? '粗探索' : '精密探索'} {progress.tested.toLocaleString()} /{' '}
-                  {Math.max(progress.total, 1).toLocaleString()}
-                </p>
-              </div>
-              <div className="mt-4 h-2.5 overflow-hidden rounded-full bg-stone-200">
-                <div
-                  className="h-full rounded-full bg-emerald-900 transition-[width] duration-150"
-                  style={{ width: `${Math.min(100, Math.max(0, progress.percent))}%` }}
-                />
-              </div>
-              {progress.byMode && !reverse ? (
+              {frontier ? (
+                <p className="text-sm text-stone-600">選択した資産の過去リターンから、リスクとリターンの地図を作成しています。</p>
+              ) : (
+                <>
+                  <div className="flex items-end justify-between gap-3">
+                    <p className="text-5xl font-semibold tabular-nums tracking-tight text-stone-900">{progress.percent}%</p>
+                    <p className="mb-1 text-sm text-stone-500">
+                      {progress.phase === 'coarse' ? '粗探索' : '精密探索'} {progress.tested.toLocaleString()} /{' '}
+                      {Math.max(progress.total, 1).toLocaleString()}
+                    </p>
+                  </div>
+                  <div className="mt-4 h-2.5 overflow-hidden rounded-full bg-stone-200">
+                    <div
+                      className="h-full rounded-full bg-emerald-900 transition-[width] duration-150"
+                      style={{ width: `${Math.min(100, Math.max(0, progress.percent))}%` }}
+                    />
+                  </div>
+                </>
+              )}
+              {progress.byMode && !reverse && !frontier ? (
                 <div className="mt-4 grid gap-2 text-sm text-stone-700">
                   {EXPLORE_MODES.map((m) => {
                     const cand = progress.byMode?.[m.id]
@@ -729,7 +955,29 @@ export default function App() {
             <>
               {result.note && <p className="text-xs text-amber-900">{result.note}</p>}
 
-              {!reverse && result.byMode && (
+              {frontier && frontierMap && (
+                <Card title="リスクとリターンの地図">
+                  <FrontierChart
+                    cloud={frontierMap.cloud}
+                    frontier={frontierMap.frontier}
+                    assets={frontierMap.assets}
+                    assetNames={chosen.map((a) => a.name)}
+                    assetColors={chosen.map((a, i) => allocColor(a.id, i))}
+                    selected={selectedPoint}
+                    target={{ mu: targetMu, sigma: targetSigma }}
+                    onPick={(sigma, mu) => {
+                      setTargetSigma(sigma)
+                      setTargetMu(mu)
+                      scheduleFrontierPick(frontierMap, sigma, mu)
+                    }}
+                  />
+                  <p className="mt-2 text-xs text-stone-500">
+                    横軸が予想リスク、縦軸が期待リターン（年率）。緑が効率的フロンティア、点は探索した配分、色付きが各資産100%です。図をクリックするか、左のスライダーで指定してください。指定した組み合わせがフロンティア上にないときは、いちばん近い効率的配分を選びます。
+                  </p>
+                </Card>
+              )}
+
+              {!reverse && !frontier && result.byMode && (
                 <div>
                   <div className="grid grid-cols-3 gap-1 rounded-xl border border-stone-300/80 bg-[#fbf8f1] p-1">
                     {EXPLORE_MODES.map((m) => {
@@ -784,6 +1032,18 @@ export default function App() {
                         毎月 {amountPrimary(monthly, currency)} ／ 目標 {amountPrimary(target, currency)}
                       </p>
                     </div>
+                  </div>
+                ) : frontier && selectedPoint ? (
+                  <div>
+                    <p className="text-sm text-stone-500">選んだ配分の期待リターン / 予想リスク（年率・税引前）</p>
+                    <p className="text-4xl font-semibold tracking-tight text-stone-900 sm:text-5xl">
+                      {pct(selectedPoint.mu, 1)}
+                      <span className="mx-2 text-2xl font-normal text-stone-400">/</span>
+                      {pct(selectedPoint.sigma, 1)}
+                    </p>
+                    <p className="mt-1 text-sm text-stone-600">
+                      指定 {pct(targetMu, 1)} / {pct(targetSigma, 1)} ／ 下の金額は Rolling の税引後手取り
+                    </p>
                   </div>
                 ) : exploreMode === 'minimax' ? (
                   <div>
@@ -981,7 +1241,7 @@ export default function App() {
                   rows={result.comparisons}
                   currency={currency}
                   reverse={reverse}
-                  highlight={!reverse ? SCORE_LABEL[exploreMode] : '最適配分'}
+                  highlight={frontier ? '選択配分' : !reverse ? SCORE_LABEL[exploreMode] : '最適配分'}
                 />
               </Card>
 
@@ -1002,6 +1262,9 @@ export default function App() {
                   過去の到達は将来を保証しません。評価は{amountBasisLabel}、外貨は
                   {hedgeMode === 'hedged' ? 'CIP推定ヘッジコスト込み' : '毎月のUSDJPY込み'}。{taxLabel}。売買 {txnCostPct}% / 積立手数料 {purchaseCostPct}% 。
                   損失の翌年繰越は未反映。データ取得日 {series.meta.fetchedAt}。探索 {result.searched.toLocaleString()} 配分。
+                  {frontier
+                    ? ' 期待リターンとリスクは共通期間の月次リターン（信託報酬・為替方針込み、税引き前）を年率換算した実績であり、将来の予測ではありません。'
+                    : ''}
                 </p>
                 {effectiveBasis === 'real' && series.inflation && (
                   <p className="mt-1 text-xs text-stone-500">

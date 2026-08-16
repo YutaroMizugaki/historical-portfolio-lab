@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Noto Sans JP",
+    ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Iowan Old Style", "Hiragino Mincho ProN", "Yu Mincho", Georgia, serif;
+}
+
+html {
+  background: #efe9dc;
+}
+
+body {
+  margin: 0;
+  min-height: 100svh;
+  color: #1c1917;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, #fff6e8 0%, transparent 50%),
+    #efe9dc;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+button {
+  cursor: pointer;
+}
+
+input,
+select,
+button {
+  font: inherit;
+}

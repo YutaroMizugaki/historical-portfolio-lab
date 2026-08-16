@@ -2,6 +2,8 @@
 
 過去のどの開始年から投資しても、目標金額へ届く配分を Rolling Backtest で探す Web アプリです。
 
+公開ページ: https://yutaromizugaki.github.io/historical-portfolio-lab/
+
 ```bash
 npm install
 npm run dev
